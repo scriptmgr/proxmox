@@ -2240,7 +2240,7 @@ append_router_bridge() {
 configure_sysctl() {
 	log_info "Configuring system parameters..."
 	
-	cat > /etc/sysctl.d/99-proxmox-bootstrap.conf <<-EOF
+	cat >/etc/sysctl.d/99-proxmox-bootstrap.conf <<-EOF
 	# IPv4 forwarding
 	net.ipv4.ip_forward=1
 	net.ipv4.conf.all.forwarding=1
@@ -2726,8 +2726,12 @@ configure_bind9() {
 	unmask_service_if_needed bind9
 	systemctl enable bind9 >/dev/null 2>&1 || true
 	systemctl restart bind9 || log_fatal "Failed to start BIND9"
-	
-	sleep 2
+
+	local bind_attempt
+	for bind_attempt in 1 2 3 4 5; do
+		sleep 1
+		systemctl is-active --quiet bind9 && break
+	done
 	if ! systemctl is-active --quiet bind9; then
 		log_error "BIND9 failed to start"
 		journalctl -u named -n 20 --no-pager
@@ -3404,6 +3408,7 @@ download_isos() {
 	
 	ISO_DIR="/var/lib/vz/template/iso"
 	mkdir -p "$ISO_DIR"
+	(
 	cd "$ISO_DIR"
 
 	local debian_base="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd"
@@ -3465,6 +3470,7 @@ download_isos() {
 	fi
 	
 	wait
+	)
 	log_success "ISO download complete"
 }
 
