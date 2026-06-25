@@ -13,20 +13,20 @@ set -euo pipefail
 # CONFIGURATION VARIABLES
 ################################################################################
 
-INSTALL_SCRIPT_VERSION="3.0.0"
-INSTALL_CONFIG_FILE="/etc/proxmox-bootstrap.conf"
-INSTALL_ENV_FILE="./.env"
-INSTALL_LOG_DIR="/var/log/proxmox-bootstrap"
-INSTALL_LOG_FILE="${INSTALL_LOG_DIR}/bootstrap.log"
-INSTALL_BACKUP_BASE_DIR="/mnt/Backups/proxmox"
-INSTALL_BACKUP_DIR="${INSTALL_BACKUP_BASE_DIR}/$(date +%Y%m%d_%H%M%S)"
-INSTALL_STATE_FILE="/var/lib/proxmox-bootstrap-state"
-INSTALL_RESOLVED_NETWORK_STATE_FILE="${INSTALL_STATE_FILE}.network"
-INSTALL_OPTIONAL_TOOLS_DIR="/usr/local/share/proxmox-bootstrap/tools"
-INSTALL_PROXMENUX_INSTALLER_URL="https://raw.githubusercontent.com/MacRimi/ProxMenux/main/install_proxmenux.sh"
-INSTALL_COMMUNITY_POST_INSTALL_URL="https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/tools/pve/post-pve-install.sh"
-INSTALL_ORIGINAL_ENV_KEYS="$(env | awk -F= '{print $1}')"
-INSTALL_SUMMARY_LINES=()
+PROXMOX_SCRIPT_VERSION="3.0.0"
+PROXMOX_CONFIG_FILE="/etc/proxmox-bootstrap.conf"
+PROXMOX_ENV_FILE="./.env"
+PROXMOX_LOG_DIR="/var/log/proxmox-bootstrap"
+PROXMOX_LOG_FILE="${PROXMOX_LOG_DIR}/bootstrap.log"
+PROXMOX_BACKUP_BASE_DIR="/mnt/Backups/proxmox"
+PROXMOX_BACKUP_DIR="${PROXMOX_BACKUP_BASE_DIR}/$(date +%Y%m%d_%H%M%S)"
+PROXMOX_STATE_FILE="/var/lib/proxmox-bootstrap-state"
+PROXMOX_RESOLVED_NETWORK_STATE_FILE="${PROXMOX_STATE_FILE}.network"
+PROXMOX_OPTIONAL_TOOLS_DIR="/usr/local/share/proxmox-bootstrap/tools"
+PROXMOX_PROXMENUX_INSTALLER_URL="https://raw.githubusercontent.com/MacRimi/ProxMenux/main/install_proxmenux.sh"
+PROXMOX_COMMUNITY_POST_INSTALL_URL="https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/tools/pve/post-pve-install.sh"
+PROXMOX_ORIGINAL_ENV_KEYS="$(env | awk -F= '{print $1}')"
+PROXMOX_SUMMARY_LINES=()
 
 WAN_NIC="${WAN_NIC:-}"
 LAN_NIC="${LAN_NIC:-}"
@@ -116,12 +116,12 @@ RUN_PROXMENUX="${RUN_PROXMENUX:-no}"
 RUN_POST_INSTALL="${RUN_POST_INSTALL:-no}"
 CONFIGURE_SDN="${CONFIGURE_SDN:-no}"
 
-INSTALL_FORCE_MODE=false
-INSTALL_CLEAR_STATE_TASK=""
+PROXMOX_FORCE_MODE=false
+PROXMOX_CLEAR_STATE_TASK=""
 
-INSTALL_PVE_MAJOR_VERSION=""
-INSTALL_DEBIAN_CODENAME=""
-INSTALL_SINGLE_NIC_MODE=false
+PROXMOX_PVE_MAJOR_VERSION=""
+PROXMOX_DEBIAN_CODENAME=""
+PROXMOX_SINGLE_NIC_MODE=false
 
 ################################################################################
 # LOGGING FUNCTIONS
@@ -134,7 +134,7 @@ __log() {
 	local timestamp
 	timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
 
-	echo "[${timestamp}] [${level}] ${msg}" >>"${INSTALL_LOG_FILE}"
+	echo "[${timestamp}] [${level}] ${msg}" >>"${PROXMOX_LOG_FILE}"
 
 	case "$level" in
 	ERROR | FATAL)
@@ -162,15 +162,15 @@ __log_fatal() {
 }
 
 __add_summary() {
-	INSTALL_SUMMARY_LINES+=("$*")
+	PROXMOX_SUMMARY_LINES+=("$*")
 }
 
 __print_summary() {
-	[ "${#INSTALL_SUMMARY_LINES[@]}" -gt 0 ] || return 0
+	[ "${#PROXMOX_SUMMARY_LINES[@]}" -gt 0 ] || return 0
 
 	__log_info "Summary:"
 	local item
-	for item in "${INSTALL_SUMMARY_LINES[@]}"; do
+	for item in "${PROXMOX_SUMMARY_LINES[@]}"; do
 		__log_info "  - ${item}"
 	done
 }
@@ -215,7 +215,7 @@ __resolved_network_override_supplied() {
 		return 0
 	fi
 
-	for file in "$INSTALL_CONFIG_FILE" "$INSTALL_ENV_FILE"; do
+	for file in "$PROXMOX_CONFIG_FILE" "$PROXMOX_ENV_FILE"; do
 		value="$(__assignment_file_value "$file" "$name" || true)"
 		[ -n "$value" ] || continue
 		if [ "$value" != "$default_value" ]; then
@@ -229,7 +229,7 @@ __resolved_network_override_supplied() {
 __runtime_env_has() {
 	local name="$1"
 	case "
-${INSTALL_ORIGINAL_ENV_KEYS}
+${PROXMOX_ORIGINAL_ENV_KEYS}
 " in
 	*"
 ${name}
@@ -486,11 +486,11 @@ __postfix_relay_explicitly_configured() {
 			[ "$value" = "mail.example.com" ] && continue
 			return 0
 		fi
-		value="$(__assignment_file_value "$INSTALL_CONFIG_FILE" "$name" || true)"
+		value="$(__assignment_file_value "$PROXMOX_CONFIG_FILE" "$name" || true)"
 		if [ -n "$value" ] && [ "$value" != "mail.example.com" ]; then
 			return 0
 		fi
-		value="$(__assignment_file_value "$INSTALL_ENV_FILE" "$name" || true)"
+		value="$(__assignment_file_value "$PROXMOX_ENV_FILE" "$name" || true)"
 		if [ -n "$value" ] && [ "$value" != "mail.example.com" ]; then
 			return 0
 		fi
@@ -507,13 +507,13 @@ __comma_list_ports() {
 }
 
 __load_resolved_network_state() {
-	[ -f "$INSTALL_RESOLVED_NETWORK_STATE_FILE" ] || return 0
+	[ -f "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" ] || return 0
 
 	local persisted_lan_br persisted_lan_nic persisted_router_br persisted_router_nic
-	persisted_lan_br="$(__assignment_file_value "$INSTALL_RESOLVED_NETWORK_STATE_FILE" "LAN_BR" || true)"
-	persisted_lan_nic="$(__assignment_file_value "$INSTALL_RESOLVED_NETWORK_STATE_FILE" "LAN_NIC" || true)"
-	persisted_router_br="$(__assignment_file_value "$INSTALL_RESOLVED_NETWORK_STATE_FILE" "ROUTER_BR" || true)"
-	persisted_router_nic="$(__assignment_file_value "$INSTALL_RESOLVED_NETWORK_STATE_FILE" "ROUTER_NIC" || true)"
+	persisted_lan_br="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "LAN_BR" || true)"
+	persisted_lan_nic="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "LAN_NIC" || true)"
+	persisted_router_br="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "ROUTER_BR" || true)"
+	persisted_router_nic="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "ROUTER_NIC" || true)"
 
 	if [ -n "$persisted_lan_br" ]; then
 		if __resolved_network_override_supplied "LAN_BR" "vmbr1"; then
@@ -558,12 +558,12 @@ __load_resolved_network_state() {
 
 __persist_resolved_network_state() {
 	local tmp_file old_lan_br old_lan_nic old_router_br old_router_nic
-	old_lan_br="$(__assignment_file_value "$INSTALL_RESOLVED_NETWORK_STATE_FILE" "LAN_BR" || true)"
-	old_lan_nic="$(__assignment_file_value "$INSTALL_RESOLVED_NETWORK_STATE_FILE" "LAN_NIC" || true)"
-	old_router_br="$(__assignment_file_value "$INSTALL_RESOLVED_NETWORK_STATE_FILE" "ROUTER_BR" || true)"
-	old_router_nic="$(__assignment_file_value "$INSTALL_RESOLVED_NETWORK_STATE_FILE" "ROUTER_NIC" || true)"
+	old_lan_br="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "LAN_BR" || true)"
+	old_lan_nic="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "LAN_NIC" || true)"
+	old_router_br="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "ROUTER_BR" || true)"
+	old_router_nic="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "ROUTER_NIC" || true)"
 
-	mkdir -p "$(dirname "$INSTALL_RESOLVED_NETWORK_STATE_FILE")"
+	mkdir -p "$(dirname "$PROXMOX_RESOLVED_NETWORK_STATE_FILE")"
 	tmp_file="$(mktemp)"
 	cat >"$tmp_file" <<-EOF
 		LAN_BR="${LAN_BR}"
@@ -571,8 +571,8 @@ __persist_resolved_network_state() {
 		ROUTER_BR="${ROUTER_BR}"
 		ROUTER_NIC="${ROUTER_NIC}"
 	EOF
-	mv "$tmp_file" "$INSTALL_RESOLVED_NETWORK_STATE_FILE"
-	chmod 600 "$INSTALL_RESOLVED_NETWORK_STATE_FILE"
+	mv "$tmp_file" "$PROXMOX_RESOLVED_NETWORK_STATE_FILE"
+	chmod 600 "$PROXMOX_RESOLVED_NETWORK_STATE_FILE"
 
 	if [ "$old_lan_br" != "$LAN_BR" ] || [ "$old_lan_nic" != "$LAN_NIC" ] || [ "$old_router_br" != "$ROUTER_BR" ] || [ "$old_router_nic" != "$ROUTER_NIC" ]; then
 		__log_info "Persisted resolved network state: lan_bridge=${LAN_BR}, lan_nic=${LAN_NIC}, router_bridge=${ROUTER_BR}, router_nic=${ROUTER_NIC}"
@@ -773,7 +773,7 @@ __validate_dhcp_v4_range() {
 __backup_file() {
 	local file="$1"
 	if [ -f "$file" ]; then
-		local backup_path="${INSTALL_BACKUP_DIR}${file}"
+		local backup_path="${PROXMOX_BACKUP_DIR}${file}"
 		mkdir -p "$(dirname "$backup_path")"
 		cp -a "$file" "$backup_path"
 		__log_info "Backed up: $file"
@@ -790,10 +790,10 @@ __check_root() {
 
 __warn_if_backup_parent_unmounted() {
 	local backup_parent
-	backup_parent="$(dirname "$INSTALL_BACKUP_BASE_DIR")"
+	backup_parent="$(dirname "$PROXMOX_BACKUP_BASE_DIR")"
 	[ -d "$backup_parent" ] || return 0
 	if ! mountpoint -q "$backup_parent" 2>/dev/null; then
-		__log_warn "Backup parent path ${backup_parent} is not a separate mount point; backups will be stored on the root filesystem unless you override INSTALL_BACKUP_BASE_DIR"
+		__log_warn "Backup parent path ${backup_parent} is not a separate mount point; backups will be stored on the root filesystem unless you override PROXMOX_BACKUP_BASE_DIR"
 	fi
 }
 
@@ -907,7 +907,7 @@ __run_apt_noninteractive() {
 		break
 	done
 
-	cat "$log_file" >>"$INSTALL_LOG_FILE"
+	cat "$log_file" >>"$PROXMOX_LOG_FILE"
 	if [ "$restore_backup" -eq 1 ]; then
 		mv "$backup_policy_rc" "$policy_rc"
 	else
@@ -931,7 +931,7 @@ __reload_network_config() {
 		for attempt in 1 2 3; do
 			output="$(ifreload -a 2>&1)"
 			rc=$?
-			[ -z "$output" ] || printf '%s\n' "$output" >>"$INSTALL_LOG_FILE"
+			[ -z "$output" ] || printf '%s\n' "$output" >>"$PROXMOX_LOG_FILE"
 			if [ "$rc" -eq 0 ]; then
 				return 0
 			fi
@@ -975,13 +975,13 @@ __detect_pve_version() {
 
 	local pve_version
 	pve_version=$(pveversion | head -n1 | cut -d'/' -f2 | cut -d'.' -f1)
-	INSTALL_PVE_MAJOR_VERSION="$pve_version"
+	PROXMOX_PVE_MAJOR_VERSION="$pve_version"
 
-	if [ "$INSTALL_PVE_MAJOR_VERSION" -lt 7 ]; then
-		__log_fatal "Unsupported Proxmox VE version: $INSTALL_PVE_MAJOR_VERSION (requires 7+)"
+	if [ "$PROXMOX_PVE_MAJOR_VERSION" -lt 7 ]; then
+		__log_fatal "Unsupported Proxmox VE version: $PROXMOX_PVE_MAJOR_VERSION (requires 7+)"
 	fi
 
-	__log_info "Detected Proxmox VE version: $INSTALL_PVE_MAJOR_VERSION"
+	__log_info "Detected Proxmox VE version: $PROXMOX_PVE_MAJOR_VERSION"
 }
 
 __get_pve_node_name() {
@@ -1061,19 +1061,19 @@ __detect_network_interfaces() {
 	fi
 
 	if [ "$nic_count" -eq 1 ]; then
-		INSTALL_SINGLE_NIC_MODE=true
+		PROXMOX_SINGLE_NIC_MODE=true
 		LAN_NIC="${LAN_NIC:-$(__next_free_dummy)}"
 		LAN_BR="$(__resolve_lan_bridge)"
 		__log_info "Single NIC detected, will use dummy interface for LAN"
 	elif [ "$nic_count" -eq 2 ]; then
-		INSTALL_SINGLE_NIC_MODE=false
+		PROXMOX_SINGLE_NIC_MODE=false
 		if [ -z "$LAN_NIC" ]; then
 			LAN_NIC=$(printf '%s\n' "$interfaces" | sed '/^$/d' | awk -v wan="$WAN_NIC" '$0 != wan { print; exit }')
 		fi
 		LAN_BR="$(__resolve_lan_bridge)"
 		__log_info "Dual NIC detected"
 	elif [ "$nic_count" -gt 2 ]; then
-		INSTALL_SINGLE_NIC_MODE=false
+		PROXMOX_SINGLE_NIC_MODE=false
 		if [ -z "$LAN_NIC" ]; then
 			LAN_NIC="$(__next_free_dummy)"
 		fi
@@ -1089,7 +1089,7 @@ __detect_network_interfaces() {
 	__log_info "  LAN NIC: ${LAN_NIC}"
 	[ -n "$ROUTER_NIC" ] && __log_info "  Router NIC: ${ROUTER_NIC}"
 	[ -n "$ROUTER_BR" ] && __log_info "  Router bridge: ${ROUTER_BR}"
-	__log_info "  Single NIC mode: ${INSTALL_SINGLE_NIC_MODE}"
+	__log_info "  Single NIC mode: ${PROXMOX_SINGLE_NIC_MODE}"
 	__persist_resolved_network_state
 }
 
@@ -1453,7 +1453,7 @@ ${wan_ip_current}/24"
 ################################################################################
 
 __create_config_file() {
-	__log_info "Creating configuration file: $INSTALL_CONFIG_FILE"
+	__log_info "Creating configuration file: $PROXMOX_CONFIG_FILE"
 
 	local config_mail_relay_host config_smtp_relay config_postfix_smtp_relay
 	config_mail_relay_host="${MAIL_RELAY_HOST}"
@@ -1463,10 +1463,10 @@ __create_config_file() {
 	[ "$config_smtp_relay" = "mail.example.com" ] && config_smtp_relay=""
 	[ "$config_postfix_smtp_relay" = "mail.example.com" ] && config_postfix_smtp_relay=""
 
-	cat >"$INSTALL_CONFIG_FILE" <<-EOF
+	cat >"$PROXMOX_CONFIG_FILE" <<-EOF
 		# Proxmox Bootstrap Configuration
 		# Generated: $(date)
-		# Version: $INSTALL_SCRIPT_VERSION
+		# Version: $PROXMOX_SCRIPT_VERSION
 
 		# Network Configuration
 		WAN_NIC="${WAN_NIC}"
@@ -1563,19 +1563,19 @@ __create_config_file() {
 		ENABLE_NESTED_VIRT="${ENABLE_NESTED_VIRT}"
 	EOF
 
-	chown root:root "$INSTALL_CONFIG_FILE"
-	chmod 600 "$INSTALL_CONFIG_FILE"
+	chown root:root "$PROXMOX_CONFIG_FILE"
+	chmod 600 "$PROXMOX_CONFIG_FILE"
 	__log_success "Configuration file created"
 }
 
 __load_config_file() {
-	if [ -f "$INSTALL_CONFIG_FILE" ]; then
-		__log_info "Loading configuration from: $INSTALL_CONFIG_FILE"
-		__load_assignment_file "$INSTALL_CONFIG_FILE"
+	if [ -f "$PROXMOX_CONFIG_FILE" ]; then
+		__log_info "Loading configuration from: $PROXMOX_CONFIG_FILE"
+		__load_assignment_file "$PROXMOX_CONFIG_FILE"
 	fi
-	if [ -f "$INSTALL_ENV_FILE" ]; then
-		__log_info "Loading environment overrides from: $INSTALL_ENV_FILE"
-		__load_assignment_file "$INSTALL_ENV_FILE"
+	if [ -f "$PROXMOX_ENV_FILE" ]; then
+		__log_info "Loading environment overrides from: $PROXMOX_ENV_FILE"
+		__load_assignment_file "$PROXMOX_ENV_FILE"
 	fi
 	__load_resolved_network_state
 	__derive_config_values
@@ -1583,14 +1583,14 @@ __load_config_file() {
 
 __state_task_done() {
 	local task="$1"
-	[ -f "$INSTALL_STATE_FILE" ] || return 1
-	awk -F'|' -v task="$task" '$1 == task { found = 1; exit 0 } END { exit(found ? 0 : 1) }' "$INSTALL_STATE_FILE"
+	[ -f "$PROXMOX_STATE_FILE" ] || return 1
+	awk -F'|' -v task="$task" '$1 == task { found = 1; exit 0 } END { exit(found ? 0 : 1) }' "$PROXMOX_STATE_FILE"
 }
 
 __with_state_lock() {
 	local lock_file lock_dir
 	local rc
-	lock_file="${INSTALL_STATE_FILE}.lock"
+	lock_file="${PROXMOX_STATE_FILE}.lock"
 	lock_dir="${lock_file}.d"
 
 	if __command_exists flock; then
@@ -1612,21 +1612,21 @@ __with_state_lock() {
 __write_task_state() {
 	local task="$1"
 	local tmp_file
-	mkdir -p "$(dirname "$INSTALL_STATE_FILE")"
+	mkdir -p "$(dirname "$PROXMOX_STATE_FILE")"
 	tmp_file="$(mktemp)"
-	if [ -f "$INSTALL_STATE_FILE" ]; then
-		awk -F'|' -v task="$task" '$1 != task' "$INSTALL_STATE_FILE" >"$tmp_file"
+	if [ -f "$PROXMOX_STATE_FILE" ]; then
+		awk -F'|' -v task="$task" '$1 != task' "$PROXMOX_STATE_FILE" >"$tmp_file"
 	fi
 	printf '%s|%s\n' "$task" "$(date '+%Y-%m-%d %H:%M:%S')" >>"$tmp_file"
-	mv "$tmp_file" "$INSTALL_STATE_FILE"
+	mv "$tmp_file" "$PROXMOX_STATE_FILE"
 }
 
 __remove_task_state() {
 	local task="$1"
 	local tmp_file
 	tmp_file="$(mktemp)"
-	awk -F'|' -v task="$task" '$1 != task' "$INSTALL_STATE_FILE" >"$tmp_file"
-	mv "$tmp_file" "$INSTALL_STATE_FILE"
+	awk -F'|' -v task="$task" '$1 != task' "$PROXMOX_STATE_FILE" >"$tmp_file"
+	mv "$tmp_file" "$PROXMOX_STATE_FILE"
 }
 
 __mark_task_done() {
@@ -1638,7 +1638,7 @@ __run_task() {
 	local task="$1"
 	local fn="$2"
 
-	if ! $INSTALL_FORCE_MODE && __state_task_done "$task"; then
+	if ! $PROXMOX_FORCE_MODE && __state_task_done "$task"; then
 		__log_info "Skipping completed task: $task"
 		return 0
 	fi
@@ -1648,7 +1648,7 @@ __run_task() {
 }
 
 __show_status() {
-	if [ ! -f "$INSTALL_STATE_FILE" ]; then
+	if [ ! -f "$PROXMOX_STATE_FILE" ]; then
 		echo "No completed tasks recorded."
 		return 0
 	fi
@@ -1657,21 +1657,21 @@ __show_status() {
 	while IFS='|' read -r task completed_at; do
 		[ -n "$task" ] || continue
 		echo "  - $task (completed: $completed_at)"
-	done <"$INSTALL_STATE_FILE"
+	done <"$PROXMOX_STATE_FILE"
 }
 
 __clear_state() {
 	local task="${1:-}"
 
 	if [ -z "$task" ]; then
-		rm -f "$INSTALL_STATE_FILE"
-		rm -f "${INSTALL_STATE_FILE}.lock"
-		rmdir "${INSTALL_STATE_FILE}.lock.d" 2>/dev/null || true
+		rm -f "$PROXMOX_STATE_FILE"
+		rm -f "${PROXMOX_STATE_FILE}.lock"
+		rmdir "${PROXMOX_STATE_FILE}.lock.d" 2>/dev/null || true
 		echo "Cleared all state."
 		return 0
 	fi
 
-	if [ ! -f "$INSTALL_STATE_FILE" ]; then
+	if [ ! -f "$PROXMOX_STATE_FILE" ]; then
 		echo "No state file exists."
 		return 0
 	fi
@@ -1681,7 +1681,7 @@ __clear_state() {
 }
 
 __reset_bootstrap() {
-	mkdir -p "$INSTALL_LOG_DIR" "$INSTALL_BACKUP_DIR"
+	mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
 	__log_warn "Resetting Proxmox bootstrap-managed configuration"
 
 	local file
@@ -1715,18 +1715,18 @@ __reset_bootstrap() {
 		rm -f /etc/pve/sdn/sdn.cfg /etc/pve/sdn/ipam.cfg
 	fi
 
-	if [ -d "$INSTALL_OPTIONAL_TOOLS_DIR" ]; then
-		mkdir -p "${INSTALL_BACKUP_DIR}${INSTALL_OPTIONAL_TOOLS_DIR}"
-		cp -a "$INSTALL_OPTIONAL_TOOLS_DIR"/. "${INSTALL_BACKUP_DIR}${INSTALL_OPTIONAL_TOOLS_DIR}/" 2>/dev/null || true
-		rm -rf "$INSTALL_OPTIONAL_TOOLS_DIR"
+	if [ -d "$PROXMOX_OPTIONAL_TOOLS_DIR" ]; then
+		mkdir -p "${PROXMOX_BACKUP_DIR}${PROXMOX_OPTIONAL_TOOLS_DIR}"
+		cp -a "$PROXMOX_OPTIONAL_TOOLS_DIR"/. "${PROXMOX_BACKUP_DIR}${PROXMOX_OPTIONAL_TOOLS_DIR}/" 2>/dev/null || true
+		rm -rf "$PROXMOX_OPTIONAL_TOOLS_DIR"
 	fi
 
 	rm -f /etc/fail2ban/jail.d/proxmox-bootstrap.conf
 	rm -f /etc/modules-load.d/proxmox-bootstrap.conf
 	rm -rf /etc/systemd/system/named.service.d
 	if [ -d /etc/nginx ]; then
-		mkdir -p "${INSTALL_BACKUP_DIR}/etc"
-		cp -a /etc/nginx "${INSTALL_BACKUP_DIR}/etc/" 2>/dev/null || true
+		mkdir -p "${PROXMOX_BACKUP_DIR}/etc"
+		cp -a /etc/nginx "${PROXMOX_BACKUP_DIR}/etc/" 2>/dev/null || true
 		find /etc/nginx -mindepth 1 ! -name mime.types -exec rm -rf {} +
 	fi
 
@@ -1739,9 +1739,9 @@ __reset_bootstrap() {
 	DEBIAN_FRONTEND=noninteractive apt-get purge -y "${packages[@]}" >/dev/null 2>&1 || __log_warn "Some bootstrap-managed packages could not be purged"
 	DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
 
-	rm -f "$INSTALL_STATE_FILE"
-	rm -f "$INSTALL_RESOLVED_NETWORK_STATE_FILE"
-	__log_success "Reset complete; backups preserved at $INSTALL_BACKUP_DIR"
+	rm -f "$PROXMOX_STATE_FILE"
+	rm -f "$PROXMOX_RESOLVED_NETWORK_STATE_FILE"
+	__log_success "Reset complete; backups preserved at $PROXMOX_BACKUP_DIR"
 }
 
 __usage() {
@@ -1749,7 +1749,7 @@ __usage() {
 		Usage: $0 [options]
 
 		Options:
-		  --init                 Create $INSTALL_CONFIG_FILE and exit
+		  --init                 Create $PROXMOX_CONFIG_FILE and exit
 		  --status               Show completed bootstrap tasks
 		  --clear-state [task]   Clear all state or one task
 		  --reset                Remove managed configuration and state
@@ -1762,7 +1762,7 @@ __parse_args() {
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 		--init)
-			mkdir -p "$INSTALL_LOG_DIR" "$INSTALL_BACKUP_DIR"
+			mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
 			__load_config_file
 			__create_config_file
 			exit 0
@@ -1773,10 +1773,10 @@ __parse_args() {
 			;;
 		--clear-state)
 			if [ "${2:-}" != "" ] && [ "${2#--}" = "$2" ]; then
-				INSTALL_CLEAR_STATE_TASK="$2"
+				PROXMOX_CLEAR_STATE_TASK="$2"
 				shift
 			fi
-			__clear_state "$INSTALL_CLEAR_STATE_TASK"
+			__clear_state "$PROXMOX_CLEAR_STATE_TASK"
 			exit 0
 			;;
 		--reset)
@@ -1784,7 +1784,7 @@ __parse_args() {
 			exit 0
 			;;
 		--force)
-			INSTALL_FORCE_MODE=true
+			PROXMOX_FORCE_MODE=true
 			;;
 		--help | -h)
 			__usage
@@ -1806,10 +1806,10 @@ __parse_args() {
 __configure_repositories() {
 	__log_info "Configuring Proxmox repositories..."
 
-	INSTALL_DEBIAN_CODENAME=$(__get_debian_codename)
-	__log_info "Detected: Proxmox VE $INSTALL_PVE_MAJOR_VERSION (Debian $INSTALL_DEBIAN_CODENAME)"
+	PROXMOX_DEBIAN_CODENAME=$(__get_debian_codename)
+	__log_info "Detected: Proxmox VE $PROXMOX_PVE_MAJOR_VERSION (Debian $PROXMOX_DEBIAN_CODENAME)"
 
-	if [ "$INSTALL_PVE_MAJOR_VERSION" -ge 9 ]; then
+	if [ "$PROXMOX_PVE_MAJOR_VERSION" -ge 9 ]; then
 		__configure_repositories_deb822
 	else
 		__configure_repositories_legacy
@@ -1841,13 +1841,13 @@ __configure_repositories_deb822() {
 	cat >/etc/apt/sources.list.d/debian.sources <<-EOF
 		Types: deb
 		URIs: http://deb.debian.org/debian/
-		Suites: ${INSTALL_DEBIAN_CODENAME} ${INSTALL_DEBIAN_CODENAME}-updates
+		Suites: ${PROXMOX_DEBIAN_CODENAME} ${PROXMOX_DEBIAN_CODENAME}-updates
 		Components: main contrib non-free non-free-firmware
 		Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 
 		Types: deb
 		URIs: http://security.debian.org/debian-security/
-		Suites: ${INSTALL_DEBIAN_CODENAME}-security
+		Suites: ${PROXMOX_DEBIAN_CODENAME}-security
 		Components: main contrib non-free non-free-firmware
 		Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 	EOF
@@ -1856,7 +1856,7 @@ __configure_repositories_deb822() {
 	cat >/etc/apt/sources.list.d/pve-enterprise.sources <<-EOF
 		# Types: deb
 		# URIs: https://enterprise.proxmox.com/debian/pve
-		# Suites: ${INSTALL_DEBIAN_CODENAME}
+		# Suites: ${PROXMOX_DEBIAN_CODENAME}
 		# Components: pve-enterprise
 		# Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 	EOF
@@ -1869,7 +1869,7 @@ __configure_repositories_deb822() {
 	cat >/etc/apt/sources.list.d/pve-no-subscription.sources <<-EOF
 		Types: deb
 		URIs: http://download.proxmox.com/debian/pve
-		Suites: ${INSTALL_DEBIAN_CODENAME}
+		Suites: ${PROXMOX_DEBIAN_CODENAME}
 		Components: pve-no-subscription
 		Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 	EOF
@@ -1883,13 +1883,13 @@ __configure_repositories_deb822() {
 __configure_repositories_legacy() {
 	__backup_file "/etc/apt/sources.list"
 	cat >/etc/apt/sources.list <<-EOF
-		deb http://deb.debian.org/debian ${INSTALL_DEBIAN_CODENAME} main contrib non-free non-free-firmware
-		deb http://deb.debian.org/debian ${INSTALL_DEBIAN_CODENAME}-updates main contrib non-free non-free-firmware
-		deb http://security.debian.org/debian-security ${INSTALL_DEBIAN_CODENAME}-security main contrib non-free non-free-firmware
+		deb http://deb.debian.org/debian ${PROXMOX_DEBIAN_CODENAME} main contrib non-free non-free-firmware
+		deb http://deb.debian.org/debian ${PROXMOX_DEBIAN_CODENAME}-updates main contrib non-free non-free-firmware
+		deb http://security.debian.org/debian-security ${PROXMOX_DEBIAN_CODENAME}-security main contrib non-free non-free-firmware
 	EOF
 
 	__backup_file "/etc/apt/sources.list.d/pve-enterprise.list"
-	echo "# deb https://enterprise.proxmox.com/debian/pve ${INSTALL_DEBIAN_CODENAME} pve-enterprise" >/etc/apt/sources.list.d/pve-enterprise.list
+	echo "# deb https://enterprise.proxmox.com/debian/pve ${PROXMOX_DEBIAN_CODENAME} pve-enterprise" >/etc/apt/sources.list.d/pve-enterprise.list
 
 	if [ -f "/etc/apt/sources.list.d/pve-install-repo.list" ]; then
 		__backup_file "/etc/apt/sources.list.d/pve-install-repo.list"
@@ -1897,7 +1897,7 @@ __configure_repositories_legacy() {
 	fi
 
 	cat >/etc/apt/sources.list.d/pve-no-subscription.list <<-EOF
-		deb http://download.proxmox.com/debian/pve ${INSTALL_DEBIAN_CODENAME} pve-no-subscription
+		deb http://download.proxmox.com/debian/pve ${PROXMOX_DEBIAN_CODENAME} pve-no-subscription
 	EOF
 
 	if [ -f "/etc/apt/sources.list.d/ceph.list" ]; then
@@ -2067,7 +2067,7 @@ __is_network_configured() {
 	__router_bridge_uses_target_port || return 1
 	__router_bridge_vlan_aware_configured || return 1
 
-	if $INSTALL_SINGLE_NIC_MODE; then
+	if $PROXMOX_SINGLE_NIC_MODE; then
 		ip link show "$LAN_NIC" >/dev/null 2>&1 && ip link show "$LAN_BR" >/dev/null 2>&1
 	else
 		ip link show "$WAN_BR" >/dev/null 2>&1 && ip link show "$LAN_BR" >/dev/null 2>&1 && { [ -z "$ROUTER_BR" ] || ip link show "$ROUTER_BR" >/dev/null 2>&1; }
@@ -3158,8 +3158,8 @@ __configure_nginx() {
 	[ -f "$nginx_ssl_key" ] || __log_fatal "Missing Proxmox SSL key: $nginx_ssl_key"
 
 	if [ -d /etc/nginx ]; then
-		mkdir -p "${INSTALL_BACKUP_DIR}/etc"
-		cp -a /etc/nginx "${INSTALL_BACKUP_DIR}/etc/" 2>/dev/null || true
+		mkdir -p "${PROXMOX_BACKUP_DIR}/etc"
+		cp -a /etc/nginx "${PROXMOX_BACKUP_DIR}/etc/" 2>/dev/null || true
 	fi
 
 	mkdir -p /etc/nginx
@@ -3534,7 +3534,7 @@ __download_optional_tool() {
 	local url="$2"
 	local target="$3"
 
-	mkdir -p "$INSTALL_OPTIONAL_TOOLS_DIR"
+	mkdir -p "$PROXMOX_OPTIONAL_TOOLS_DIR"
 	__log_info "Downloading ${name}..."
 	if curl -fsSL "$url" -o "$target"; then
 		chmod 700 "$target"
@@ -3548,15 +3548,15 @@ __download_optional_tool() {
 __download_proxmenux_tool() {
 	__download_optional_tool \
 		"ProxMenux installer" \
-		"$INSTALL_PROXMENUX_INSTALLER_URL" \
-		"${INSTALL_OPTIONAL_TOOLS_DIR}/install_proxmenux.sh"
+		"$PROXMOX_PROXMENUX_INSTALLER_URL" \
+		"${PROXMOX_OPTIONAL_TOOLS_DIR}/install_proxmenux.sh"
 }
 
 __download_community_post_install_tool() {
 	__download_optional_tool \
 		"community Proxmox post-install script" \
-		"$INSTALL_COMMUNITY_POST_INSTALL_URL" \
-		"${INSTALL_OPTIONAL_TOOLS_DIR}/post-pve-install.sh"
+		"$PROXMOX_COMMUNITY_POST_INSTALL_URL" \
+		"${PROXMOX_OPTIONAL_TOOLS_DIR}/post-pve-install.sh"
 }
 
 ################################################################################
@@ -3567,11 +3567,11 @@ __main() {
 	__parse_args "$@"
 	__check_root
 
-	mkdir -p "$INSTALL_LOG_DIR" "$INSTALL_BACKUP_DIR"
+	mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
 	__warn_if_backup_parent_unmounted
 
-	__log_info "Proxmox Bootstrap Script v${INSTALL_SCRIPT_VERSION}"
-	__log_info "Log file: $INSTALL_LOG_FILE"
+	__log_info "Proxmox Bootstrap Script v${PROXMOX_SCRIPT_VERSION}"
+	__log_info "Log file: $PROXMOX_LOG_FILE"
 
 	__load_config_file
 	__detect_pve_version
@@ -3631,7 +3631,7 @@ __main() {
 	fi
 	__log_info "  - DNS Server: ${LAN_V4_IP}"
 	__log_info "  - DHCP Range: ${DHCP_V4_START} - ${DHCP_V4_END}"
-	__log_info "  - Log file: $INSTALL_LOG_FILE"
+	__log_info "  - Log file: $PROXMOX_LOG_FILE"
 	__log_info "  - Reboot recommended if kernel or core packages changed"
 }
 
