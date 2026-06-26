@@ -476,13 +476,13 @@ __configure_nested_virtualization() {
 	modprobe "$module" >/dev/null 2>&1 || true
 	nested_param="/sys/module/${module}/parameters/nested"
 	if [ -w "$nested_param" ]; then
-		current_value="$(cat "$nested_param" 2>/dev/null || true)"
+		current_value="$(< "$nested_param" 2>/dev/null || true)"
 		if [ "$current_value" != "$nested_value" ]; then
 			printf '%s' "$nested_value" >"$nested_param" 2>/dev/null || true
 		fi
 	fi
 
-	current_value="$(cat "$nested_param" 2>/dev/null || true)"
+	current_value="$(< "$nested_param" 2>/dev/null || true)"
 	case "$current_value" in
 	1 | Y | y)
 		__add_summary "Enabled nested virtualization for ${module}"
