@@ -862,10 +862,10 @@ set -euo pipefail
 	key_tmp="$(mktemp)"
 	trap 'rm -f "$cert_tmp" "$key_tmp"' EXIT
 
-	cat "${lineage}/fullchain.pem" >"$cert_tmp"
-	cat "${lineage}/privkey.pem" >"$key_tmp"
-	cat "$cert_tmp" >/etc/pve/local/pve-ssl.pem
-	cat "$key_tmp" >/etc/pve/local/pve-ssl.key
+	cp "${lineage}/fullchain.pem" "$cert_tmp"
+	cp "${lineage}/privkey.pem" "$key_tmp"
+	cp "$cert_tmp" /etc/pve/local/pve-ssl.pem
+	cp "$key_tmp" /etc/pve/local/pve-ssl.key
 
 	systemctl reload-or-restart pveproxy >/dev/null 2>&1 || systemctl restart pveproxy >/dev/null 2>&1 || true
 	if systemctl is-active --quiet nginx; then
@@ -2254,23 +2254,23 @@ __append_router_bridge() {
 
 __configure_sysctl() {
 	__log_info "Configuring system parameters..."
-	
+
 	cat >/etc/sysctl.d/99-proxmox-bootstrap.conf <<-EOF
 	# IPv4 forwarding
 	net.ipv4.ip_forward=1
 	net.ipv4.conf.all.forwarding=1
-	
+
 	# IPv6 forwarding
 	net.ipv6.conf.all.forwarding=1
 	net.ipv6.conf.default.forwarding=1
-	
+
 	# Memory overcommit for virtualization
 	vm.overcommit_memory=1
 	vm.overcommit_ratio=100
-	
+
 	# Kernel same-page merging (KSM) for memory deduplication
 	kernel.sched_autogroup_enabled=0
-	
+
 	# Network performance tuning
 	net.core.netdev_max_backlog=5000
 	net.core.rmem_max=134217728
@@ -2278,9 +2278,9 @@ __configure_sysctl() {
 	net.ipv4.tcp_rmem=4096 87380 67108864
 	net.ipv4.tcp_wmem=4096 65536 67108864
 	EOF
-	
+
 	sysctl --system >/dev/null 2>&1
-	
+
 	__log_success "System parameters configured"
 }
 
@@ -2290,29 +2290,29 @@ __configure_sysctl() {
 
 __configure_ssh() {
 	__log_info "Optimizing SSH configuration..."
-	
+
 	__backup_file /etc/ssh/sshd_config
-	
+
 	if ! grep -qE -- "^[[:space:]]*MaxStartups" /etc/ssh/sshd_config; then
 		echo "MaxStartups 100:30:200" >> /etc/ssh/sshd_config
 	else
 		sed -i 's/^[[:space:]]*MaxStartups.*/MaxStartups 100:30:200/' /etc/ssh/sshd_config
 	fi
-	
+
 	if ! grep -qE -- "^[[:space:]]*ClientAliveInterval" /etc/ssh/sshd_config; then
 		echo "ClientAliveInterval 60" >> /etc/ssh/sshd_config
 	else
 		sed -i 's/^[[:space:]]*ClientAliveInterval.*/ClientAliveInterval 60/' /etc/ssh/sshd_config
 	fi
-	
+
 	if ! grep -qE -- "^[[:space:]]*ClientAliveCountMax" /etc/ssh/sshd_config; then
 		echo "ClientAliveCountMax 10" >> /etc/ssh/sshd_config
 	else
 		sed -i 's/^[[:space:]]*ClientAliveCountMax.*/ClientAliveCountMax 10/' /etc/ssh/sshd_config
 	fi
-	
+
 	systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
-	
+
 	__log_success "SSH configured"
 }
 
@@ -2386,7 +2386,7 @@ __configure_subscription_nag() {
 
 __configure_nftables() {
 	__log_info "Configuring nftables firewall..."
-	
+
 	__backup_file /etc/nftables.conf
 	local nat66_rules=""
 	local wan_mail_input="iifname \"${WAN_BR}\" tcp dport {25, 465, 587} drop"
@@ -2451,51 +2451,51 @@ __configure_nftables() {
 		wan_dns_input="iifname \"${WAN_BR}\" udp dport 53 accept
     iifname \"${WAN_BR}\" tcp dport 53 accept"
 	fi
-	
+
 	cat > /etc/nftables.conf <<-EOF
 	#!/usr/sbin/nft -f
-	
+
 	flush ruleset
-	
+
 	table inet filter {
 	  chain input {
 	    type filter hook input priority filter; policy drop;
-	    
+
 	    ct state invalid drop
 	    ct state established,related accept
-	    
+
 	    iifname "lo" accept
 	    iifname "$LAN_BR" accept
-	    
+
 	    ip protocol icmp accept
 	    ip6 nexthdr icmpv6 accept
-	    
+
 	    iifname "$WAN_BR" tcp dport 22 accept
 	    iifname "$WAN_BR" tcp dport 80 accept
 	    iifname "$WAN_BR" tcp dport 443 accept
 	    iifname "$WAN_BR" tcp dport 8006 accept
 	    iifname "$WAN_BR" tcp dport 3128 accept
 	    ${wan_dns_input}
-	    
+
 	    ${wan_mail_input}
 	  }
-	  
+
 	  chain forward {
 	    type filter hook forward priority filter; policy drop;
-	    
+
 	    ct state invalid drop
 	    ct state established,related accept
-	    
+
 	    iifname "$LAN_BR" oifname "$WAN_BR" accept
 	    iifname "$WAN_BR" oifname "$LAN_BR" ct state established,related accept
 	    ${forward_accept_rules}
 	  }
-	  
+
 	  chain output {
 	    type filter hook output priority filter; policy accept;
 	  }
 	}
-	
+
 	table ip nat {
 	  chain prerouting {
 	    type nat hook prerouting priority dstnat; policy accept;
@@ -2509,13 +2509,13 @@ __configure_nftables() {
 	}
 	${nat66_rules}
 	EOF
-	
+
 	nft -c -f /etc/nftables.conf || __log_fatal "Invalid nftables configuration"
-	
+
 	__unmask_service_if_needed nftables
 	systemctl enable nftables >/dev/null 2>&1 || true
 	systemctl restart nftables || __log_fatal "Failed to restart nftables"
-	
+
 	__log_success "Firewall configured"
 }
 
@@ -2536,7 +2536,7 @@ __configure_bind9() {
 	fi
 
 	__log_info "Configuring BIND9 DNS server..."
-	
+
 	local lan_zone_file reverse_zone_file wan_zone_file listen_v4 listen_v6 default_zone_block trusted_acl
 	mkdir -p /etc/bind/keys /var/cache/bind/zones/{primary,secondary,forward,reverse} /var/log/bind /run/named
 	chown -R bind:bind /var/cache/bind /var/log/bind /run/named /etc/bind/keys
@@ -2553,19 +2553,20 @@ __configure_bind9() {
 	if __command_exists aa-status && [ -f /etc/apparmor.d/usr.sbin.named ]; then
 		apparmor_parser -r /etc/apparmor.d/usr.sbin.named >/dev/null 2>&1 || __log_warn "Could not reload AppArmor profile: /etc/apparmor.d/usr.sbin.named"
 	fi
-	
+
 	if [ ! -f /var/cache/bind/root.cache ]; then
 		curl -fsSL https://www.internic.net/domain/named.root -o /var/cache/bind/root.cache 2>/dev/null || true
 	fi
-	
+
 	__log_info "Generating BIND9 TSIG keys..."
+	local DDNS_KEY DHCP_KEY RNDC_KEY CERTBOT_KEY BACKUP_KEY
 	DDNS_KEY=$(openssl rand -base64 32 2>/dev/null | tr -d '\n' || dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -d '\n')
 	DHCP_KEY=$(openssl rand -base64 64 2>/dev/null | tr -d '\n' || dd if=/dev/urandom bs=64 count=1 2>/dev/null | base64 | tr -d '\n')
 	RNDC_KEY=$(openssl rand -base64 64 2>/dev/null | tr -d '\n' || dd if=/dev/urandom bs=64 count=1 2>/dev/null | base64 | tr -d '\n')
 	CERTBOT_KEY=$(openssl rand -base64 64 2>/dev/null | tr -d '\n' || dd if=/dev/urandom bs=64 count=1 2>/dev/null | base64 | tr -d '\n')
 	BACKUP_KEY=$(openssl rand -base64 64 2>/dev/null | tr -d '\n' || dd if=/dev/urandom bs=64 count=1 2>/dev/null | base64 | tr -d '\n')
 	__log_success "Generated BIND9 keys"
-	
+
 	__backup_file /etc/bind/named.conf
 	__backup_file /etc/bind/zones.conf
 	cat >/etc/bind/dhcp.key <<-EOF
@@ -2577,6 +2578,7 @@ __configure_bind9() {
 	chmod 600 /etc/bind/dhcp.key /etc/bind/rndc.key
 	chown bind:bind /etc/bind/dhcp.key /etc/bind/rndc.key
 
+	local SERIAL REV_ZONE
 	SERIAL=$(date +%Y%m%d01)
 	REV_ZONE=$(__reverse_zone_name "$LAN_V4_NET")
 	lan_zone_file="/var/cache/bind/zones/primary/${LAN_DOMAIN}.zone"
@@ -2591,21 +2593,21 @@ __configure_bind9() {
 		listen_v6="${listen_v6} ${WAN_V6%%/*};"
 	fi
 	trusted_acl="127.0.0.0/8; ::1; ${LAN_V4_NET}; ${LAN_V6_PREFIX};"
-	
+
 	cat > /etc/bind/named.conf <<-EOF
 	key "ddns-key" { algorithm hmac-sha256; secret "$DDNS_KEY"; };
 	key "dhcp-key" { algorithm hmac-sha512; secret "$DHCP_KEY"; };
 	key "rndc-key" { algorithm hmac-sha512; secret "$RNDC_KEY"; };
 	key "certbot." { algorithm hmac-sha512; secret "$CERTBOT_KEY"; };
 	key "backup-key" { algorithm hmac-sha512; secret "$BACKUP_KEY"; };
-	
+
 	controls { inet 127.0.0.1 port 953 allow { 127.0.0.1; } keys { "rndc-key"; }; };
-	
+
 	acl "all" { 0.0.0.0/0; ::/0; };
 	acl "trusted" { ${trusted_acl} };
 	acl "updates" { key "dhcp-key"; key "certbot."; key "ddns-key"; };
 	acl "transfers" { key "dhcp-key"; key "certbot."; key "backup-key"; trusted; };
-	
+
 	options {
 	  version "9";
 	  listen-on { ${listen_v4} };
@@ -2631,7 +2633,7 @@ __configure_bind9() {
 	  memstatistics-file "/var/log/bind/mem.stats";
 	  forwarders { ${FWD1}; ${FWD2}; ${FWD3}; };
 	};
-	
+
 	logging {
 	  channel default_log { file "/var/log/bind/default.log" versions 3 size 5m; severity info; print-time yes; };
 	  channel query_log { file "/var/log/bind/query.log" versions 3 size 5m; severity info; print-time yes; };
@@ -2645,7 +2647,7 @@ __configure_bind9() {
 	  category xfer-out { xfer_log; };
 	  category security { security_log; };
 	};
-	
+
 	include "/etc/bind/zones.conf";
 	EOF
 
@@ -2658,7 +2660,7 @@ __configure_bind9() {
 		  allow-update { updates; };
 		  allow-transfer { transfers; };
 		};
-		
+
 		zone "$REV_ZONE" {
 		  type master;
 		  file "${reverse_zone_file}";
@@ -2692,7 +2694,7 @@ __configure_bind9() {
 	else
 		printf '%s\n' "$default_zone_block" >/etc/bind/zones.conf
 	fi
-	
+
 	cat > "${lan_zone_file}" <<-EOF
 	\$TTL 86400
 	@   IN SOA ns1.${LAN_DOMAIN}. hostmaster.${LAN_DOMAIN}. ( $SERIAL 3600 900 1209600 86400 )
@@ -2702,7 +2704,7 @@ __configure_bind9() {
 	gw  IN A   ${LAN_V4_IP}
 	$(__get_pve_node_name) IN A ${LAN_V4_IP}
 	EOF
-	
+
 	cat > "${reverse_zone_file}" <<-EOF
 	\$TTL 86400
 	@   IN SOA ns1.${LAN_DOMAIN}. hostmaster.${LAN_DOMAIN}. ( $SERIAL 3600 900 1209600 86400 )
@@ -2720,23 +2722,23 @@ __configure_bind9() {
 			cat "$DNS_WAN_RECORDS_FILE" >>"${wan_zone_file}"
 		fi
 	fi
-	
+
 	chown -R bind:bind /etc/bind /var/cache/bind /var/log/bind /run/named
-	
+
 	named-checkconf /etc/bind/named.conf || __log_fatal "Invalid BIND configuration"
 	named-checkzone "$LAN_DOMAIN" "$lan_zone_file" >/dev/null 2>&1 || __log_fatal "Invalid LAN forward zone: $lan_zone_file"
 	named-checkzone "$REV_ZONE" "$reverse_zone_file" >/dev/null 2>&1 || __log_fatal "Invalid LAN reverse zone: $reverse_zone_file"
 	if __is_enabled "$DNS_SPLIT_ENABLE" && [ -n "$DNS_WAN_ZONE" ]; then
 		named-checkzone "$DNS_WAN_ZONE" "$wan_zone_file" >/dev/null 2>&1 || __log_fatal "Invalid WAN zone: $wan_zone_file"
 	fi
-	
+
 	mkdir -p /etc/systemd/system/named.service.d
 	cat > /etc/systemd/system/named.service.d/override.conf <<-'SYSTEMD'
 	[Service]
 	Type=simple
 	TimeoutStartSec=180
 	SYSTEMD
-	
+
 	systemctl daemon-reload
 	__unmask_service_if_needed bind9
 	systemctl enable bind9 >/dev/null 2>&1 || true
@@ -2752,7 +2754,7 @@ __configure_bind9() {
 		journalctl -u named -n 20 --no-pager
 		__log_fatal "DNS server configuration failed"
 	fi
-	
+
 	__log_success "DNS server configured"
 }
 
@@ -2788,12 +2790,12 @@ __configure_dhcp() {
 
 	__log_info "Configuring DHCP servers..."
 	systemctl disable --now isc-dhcp-relay >/dev/null 2>&1 || true
-	
+
 	local dhcp_reverse_zone dhcp_subnet_mask dhcp_v4_dns_servers dhcp_v6_dns_server
 	__backup_file /etc/default/isc-dhcp-server
 	__backup_file /etc/dhcp/dhcpd.conf
 	__backup_file /etc/dhcp/dhcpd6.conf
-	
+
 	cat > /etc/default/isc-dhcp-server <<-EOF
 	INTERFACESv4="$LAN_BR"
 	INTERFACESv6="$LAN_BR"
@@ -2809,7 +2811,7 @@ __configure_dhcp() {
 		dhcp_v4_dns_servers="${LAN_V4_IP}"
 		dhcp_v6_dns_server="${LAN_V6_ROUTER_IP}"
 	fi
-	
+
 	DHCP_KEY=""
 	if [ "$DNS_SERVER_TYPE" = "local" ]; then
 		DHCP_KEY=$(awk -F'secret "' '/^key "dhcp-key"/ { split($2, a, "\""); print a[1]; exit }' /etc/bind/named.conf)
@@ -2817,7 +2819,7 @@ __configure_dhcp() {
 			__log_fatal "Unable to read BIND DHCP TSIG key"
 		fi
 	fi
-	
+
 	cat > /etc/dhcp/dhcpd.conf <<-EOF
 	authoritative;
 	default-lease-time 3600;
@@ -2830,20 +2832,20 @@ __configure_dhcp() {
 		dhcp_subnet_mask="$(__netmask_from_prefix "${LAN_V4_NET#*/}")"
 		cat >>/etc/dhcp/dhcpd.conf <<-EOF
 	key "dhcp-key" { algorithm hmac-sha512; secret "$DHCP_KEY"; };
-	
+
 	option domain-name "${LAN_DOMAIN}";
 	option domain-name-servers ${dhcp_v4_dns_servers};
-	
+
 	ddns-update-style interim;
 	ddns-updates on;
 	ddns-domainname "${LAN_DOMAIN}.";
 	ddns-rev-domainname "in-addr.arpa.";
-	
+
 	zone ${LAN_DOMAIN}. {
 	  primary ${LAN_V4_IP};
 	  key "dhcp-key";
 	}
-	
+
 	zone ${dhcp_reverse_zone} {
 		  primary ${LAN_V4_IP};
 	  key "dhcp-key";
@@ -2864,7 +2866,7 @@ __configure_dhcp() {
 	  option broadcast-address ${LAN_V4_BRD};
 	}
 	EOF
-	
+
 	if [ "$RA_SERVER_TYPE" = "disabled" ]; then
 		: >/etc/dhcp/dhcpd6.conf
 	else
@@ -2876,22 +2878,22 @@ __configure_dhcp() {
 
 	$( [ -n "$dhcp_v6_dns_server" ] && printf 'option dhcp6.name-servers %s;\n' "$dhcp_v6_dns_server" )
 	option dhcp6.domain-search "${LAN_DOMAIN}";
-	
+
 	subnet6 ${LAN_V6_PREFIX} {
 	  range6 ${LAN_V6_RANGE_LOW} ${LAN_V6_RANGE_HIGH};
 	}
 		EOF
 	fi
-	
+
 	touch /var/lib/dhcp/dhcpd.leases
 	touch /var/lib/dhcp/dhcpd6.leases
-	
+
 	dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1 || __log_fatal "Invalid DHCPv4 configuration"
-	
+
 	__unmask_service_if_needed isc-dhcp-server
 	systemctl enable isc-dhcp-server >/dev/null 2>&1 || true
 	systemctl restart isc-dhcp-server || __log_fatal "Failed to restart isc-dhcp-server"
-	
+
 	__log_success "DHCP configured"
 }
 
@@ -2907,31 +2909,31 @@ __configure_radvd() {
 	fi
 
 	__log_info "Configuring IPv6 Router Advertisement..."
-	
+
 	__backup_file /etc/radvd.conf
-	
+
 	cat > /etc/radvd.conf <<-EOF
 	interface $LAN_BR {
 	  AdvSendAdvert on;
 	  MaxRtrAdvInterval 30;
 	  AdvManagedFlag off;
 	  AdvOtherConfigFlag on;
-	  
+
 	  prefix ${LAN_V6_PREFIX} {
 	    AdvOnLink on;
 	    AdvAutonomous on;
 	  };
-	  
+
 	  RDNSS ${LAN_V6_ROUTER_IP} { };
 	};
 	EOF
-	
+
 	radvd -C /etc/radvd.conf -n -c >/dev/null 2>&1 || __log_warn "radvd config validation failed"
-	
+
 	__unmask_service_if_needed radvd
 	systemctl enable radvd >/dev/null 2>&1 || true
 	systemctl restart radvd || __log_fatal "Failed to restart radvd"
-	
+
 	__log_success "IPv6 RA configured"
 }
 
@@ -2954,16 +2956,16 @@ __configure_postfix() {
 		__log_warn "POSTFIX_FORWARD_HOST unavailable; falling back to local Postfix behavior"
 		POSTFIX_SERVER_TYPE="local"
 	fi
-	
+
 	__log_info "Configuring Postfix (${POSTFIX_SERVER_TYPE})..."
-	
+
 	if ! __command_exists postfix; then
 		DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postfix >/dev/null 2>&1
 	fi
-	
+
 	__backup_file /etc/postfix/main.cf
 	__backup_file /etc/aliases
-	
+
 	postconf -e "myhostname = ${POSTFIX_MYHOSTNAME}"
 	postconf -e "mydomain = ${POSTFIX_MYDOMAIN}"
 	postconf -e "myorigin = \$mydomain"
@@ -3030,16 +3032,16 @@ __configure_postfix() {
 		/.*/ ${POSTFIX_FROM_EMAIL}
 	EOF
 	postconf -e "sender_canonical_maps = regexp:/etc/postfix/sender_canonical"
-	
+
 	if [ ! -f /etc/aliases ] || ! grep -q -- "^root:" /etc/aliases; then
 		echo "root: ${POSTFIX_ROOT_FORWARD}" >> /etc/aliases
 	fi
 	newaliases >/dev/null 2>&1
-	
+
 	__unmask_service_if_needed postfix
 	systemctl enable postfix >/dev/null 2>&1 || true
 	systemctl restart postfix || __log_fatal "Failed to restart postfix"
-	
+
 	__log_success "Postfix configured"
 	if [ "$POSTFIX_SERVER_TYPE" = "internet" ] || __is_enabled "$POSTFIX_WAN_ENABLE"; then
 		__add_summary "Enabled WAN mail exposure for ports 25, 465, 587"
@@ -3288,38 +3290,38 @@ __configure_nginx() {
 
 __configure_sdn() {
 	__log_info "Configuring Proxmox SDN..."
-	
+
 	mkdir -p /etc/pve/sdn
-	
+
 	if [ ! -f /etc/pve/sdn/sdn.cfg ]; then
 		cat > /etc/pve/sdn/sdn.cfg <<-EOF
 		zone: localnet
 		        type simple
 		        bridge ${LAN_BR}
 		        ipam pve
-		
+
 		vnet: vnet100
 		        zone localnet
 		        tag 100
-		
+
 		vnet: vnet200
 		        zone localnet
 		        tag 200
-		
+
 		vnet: vnet300
 		        zone localnet
 		        tag 300
 		EOF
 	fi
-	
+
 	if [ ! -f /etc/pve/sdn/ipam.cfg ]; then
 		cat > /etc/pve/sdn/ipam.cfg <<-EOF
 		pve: local
 		EOF
 	fi
-	
+
 	pvesh create /cluster/sdn >/dev/null 2>&1 || true
-	
+
 	__log_success "SDN configured"
 }
 
@@ -3350,8 +3352,8 @@ __configure_vm_defaults() {
 	if [ -d /etc/pve/qemu-server ]; then
 		for conf in /etc/pve/qemu-server/*.conf; do
 			[ -f "$conf" ] || continue
+			local vmid net_count net_line net_value updated_value
 			vmid=$(basename "$conf" .conf)
-			local net_count net_line net_value updated_value
 			net_count="$(grep -cE -- '^net[0-9]+:' "$conf" 2>/dev/null || true)"
 			if [ "$net_count" -eq 1 ]; then
 				net_line="$(grep -E -- '^net[0-9]+:' "$conf" | head -n1)"
@@ -3367,12 +3369,12 @@ __configure_vm_defaults() {
 			fi
 		done
 	fi
-	
+
 	if [ -d /etc/pve/lxc ]; then
 		for conf in /etc/pve/lxc/*.conf; do
 			[ -f "$conf" ] || continue
+			local ctid net_count net_line net_value updated_value
 			ctid=$(basename "$conf" .conf)
-			local net_count net_line net_value updated_value
 			net_count="$(grep -cE -- '^net[0-9]+:' "$conf" 2>/dev/null || true)"
 			if [ "$net_count" -eq 1 ]; then
 				net_line="$(grep -E -- '^net[0-9]+:' "$conf" | head -n1)"
@@ -3384,7 +3386,7 @@ __configure_vm_defaults() {
 			fi
 		done
 	fi
-	
+
 	__log_success "VM defaults configured"
 	__add_summary "Updated guest defaults: ${vm_updates} VM NICs, ${ct_updates} LXC NICs, ${spice_updates} VM display defaults"
 }
@@ -3397,13 +3399,13 @@ __download_templates() {
 	if ! __is_enabled "$DOWNLOAD_TEMPLATES"; then
 		return
 	fi
-	
+
 	__log_info "Downloading LXC templates..."
 	if ! __command_exists pveam; then
 		__log_warn "pveam not available, skipping template downloads"
 		return 0
 	fi
-	
+
 	pveam update >/dev/null 2>&1 || true
 
 	local template
@@ -3423,10 +3425,10 @@ __download_isos() {
 	if ! __is_enabled "$DOWNLOAD_ISOS"; then
 		return
 	fi
-	
+
 	__log_info "Downloading ISOs..."
-	
-	ISO_DIR="/var/lib/vz/template/iso"
+
+	local ISO_DIR="/var/lib/vz/template/iso"
 	mkdir -p "$ISO_DIR"
 	(
 	cd "$ISO_DIR"
@@ -3489,7 +3491,7 @@ __download_isos() {
 	elif [ -n "$PFSENSE_ISO" ] && [ -f "${PFSENSE_ISO%.gz}" ]; then
 		__mark_task_done "iso:${PFSENSE_ISO%.gz}"
 	fi
-	
+
 	wait
 	)
 	__log_success "ISO download complete"
