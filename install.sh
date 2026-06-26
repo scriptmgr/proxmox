@@ -39,7 +39,6 @@ PROXMOX_STATE_FILE="/var/lib/proxmox-bootstrap-state"
 PROXMOX_RESOLVED_NETWORK_STATE_FILE="${PROXMOX_STATE_FILE}.network"
 PROXMOX_OPTIONAL_TOOLS_DIR="/usr/local/share/proxmox-bootstrap/tools"
 PROXMOX_PROXMENUX_INSTALLER_URL="https://raw.githubusercontent.com/MacRimi/ProxMenux/main/install_proxmenux.sh"
-PROXMOX_COMMUNITY_POST_INSTALL_URL="https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/tools/pve/post-pve-install.sh"
 PROXMOX_ORIGINAL_ENV_KEYS="$(env | awk -F= '{print $1}')"
 PROXMOX_SUMMARY_LINES=()
 
@@ -125,7 +124,6 @@ ENABLE_NESTED_VIRT="${ENABLE_NESTED_VIRT:-yes}"
 DOWNLOAD_ISOS="${DOWNLOAD_ISOS:-no}"
 DOWNLOAD_TEMPLATES="${DOWNLOAD_TEMPLATES:-no}"
 RUN_PROXMENUX="${RUN_PROXMENUX:-no}"
-RUN_POST_INSTALL="${RUN_POST_INSTALL:-no}"
 CONFIGURE_SDN="${CONFIGURE_SDN:-no}"
 
 PROXMOX_FORCE_MODE=false
@@ -1574,7 +1572,6 @@ __create_config_file() {
 		DOWNLOAD_ISOS="${DOWNLOAD_ISOS}"
 		DOWNLOAD_TEMPLATES="${DOWNLOAD_TEMPLATES}"
 		RUN_PROXMENUX="${RUN_PROXMENUX}"
-		RUN_POST_INSTALL="${RUN_POST_INSTALL}"
 		CONFIGURE_SDN="${CONFIGURE_SDN}"
 		DISABLE_SUBSCRIPTION_NAG="${DISABLE_SUBSCRIPTION_NAG}"
 		AUTO_DIST_UPGRADE="${AUTO_DIST_UPGRADE}"
@@ -3593,13 +3590,6 @@ __download_proxmenux_tool() {
 		"${PROXMOX_OPTIONAL_TOOLS_DIR}/install_proxmenux.sh"
 }
 
-__download_community_post_install_tool() {
-	__download_optional_tool \
-		"community Proxmox post-install script" \
-		"$PROXMOX_COMMUNITY_POST_INSTALL_URL" \
-		"${PROXMOX_OPTIONAL_TOOLS_DIR}/post-pve-install.sh"
-}
-
 ################################################################################
 # MAIN EXECUTION
 ################################################################################
@@ -3653,9 +3643,6 @@ __main() {
 	fi
 	if __is_enabled "$RUN_PROXMENUX"; then
 		__run_task proxmenux_tool __download_proxmenux_tool
-	fi
-	if __is_enabled "$RUN_POST_INSTALL"; then
-		__run_task community_post_install_tool __download_community_post_install_tool
 	fi
 
 	__log_success "Bootstrap complete!"
