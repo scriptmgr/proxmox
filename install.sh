@@ -85,7 +85,7 @@ CONFIGURE_POSTFIX="${CONFIGURE_POSTFIX:-yes}"
 POSTFIX_SERVER_TYPE="${POSTFIX_SERVER_TYPE:-local}"
 POSTFIX_SMTP_RELAY="${POSTFIX_SMTP_RELAY:-}"
 POSTFIX_SMTP_PORT="${POSTFIX_SMTP_PORT:-}"
-POSTFIX_FROM_EMAIL="${POSTFIX_FROM_EMAIL:-root@localhost}"
+POSTFIX_FROM_EMAIL="${POSTFIX_FROM_EMAIL:-no-reply@${HOSTNAME}}"
 POSTFIX_FROM_NAME="${POSTFIX_FROM_NAME:-Proxmox}"
 POSTFIX_ROOT_FORWARD="${POSTFIX_ROOT_FORWARD:-root@localhost}"
 POSTFIX_MYHOSTNAME="${POSTFIX_MYHOSTNAME:-}"
@@ -616,12 +616,12 @@ __detect_lan_domain() {
 	domain="$(hostname -d 2>/dev/null || true)"
 	if [ -n "$domain" ] && [ "$domain" != "(none)" ]; then
 		echo "$domain"
-		return
+		return 0
 	fi
 	short="$(hostname -s 2>/dev/null || true)"
 	if [ -n "$short" ] && [ "$short" != "(none)" ]; then
 		echo "${short}.home"
-		return
+		return 0
 	fi
 	echo "pve.home"
 }
@@ -1169,7 +1169,7 @@ __resolve_lan_bridge() {
 		ports="$(__bridge_ports_for "$LAN_BR" | tr '\n' ' ')"
 		if [ -n "$ports" ] && ! echo "$ports" | grep -qw -- "$LAN_NIC"; then
 			__next_free_bridge
-			return
+			return 0
 		fi
 	fi
 	echo "$LAN_BR"
@@ -1412,7 +1412,7 @@ __existing_lan_bridge() {
 	for bridge in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -- '^vmbr' || true); do
 		if ip -4 addr show "$bridge" 2>/dev/null | grep -q -- "inet ${LAN_V4_IP}/"; then
 			echo "$bridge"
-			return
+			return 0
 		fi
 	done
 }
@@ -1785,6 +1785,8 @@ __parse_args() {
 		--init)
 			mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
 			__load_config_file
+			__detect_network_interfaces
+			__derive_config_values
 			__create_config_file
 			exit 0
 			;;
