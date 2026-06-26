@@ -47,6 +47,9 @@ chmod +x install.sh
 --clear-state [task]   Clear all task state or one named task and exit 0
 --reset                Remove bootstrap-managed configuration and state
 --force                Re-run tasks even when state says complete
+--debug                Enable debug output
+--color auto|yes|no    Control color output (default: auto)
+--version, -v          Print version and exit
 ```
 
 Unknown options exit with status `2`.
@@ -90,6 +93,7 @@ Disabled by default unless explicitly enabled:
 - Subscription nag removal
 - Postfix
 - VLAN readiness via `8021q`
+- KVM nested virtualization (`ENABLE_NESTED_VIRT=yes`)
 
 ## Configuration
 
@@ -108,6 +112,10 @@ Useful automation controls:
 AUTO_DIST_UPGRADE="yes"        # apply non-interactive dist-upgrade after repo setup
 PIN_NEWEST_PVE_KERNEL="yes"    # pin the newest installed Proxmox kernel
 PVE_KERNEL_KEEP_COUNT="2"      # keep two installed Proxmox kernel versions total
+ENABLE_NESTED_VIRT="yes"       # enable KVM nested virtualization (default: yes)
+CONFIGURE_POSTFIX="yes"        # set to no to skip all Postfix configuration (default: yes)
+PVE_NODE_NAME=""               # rename the Proxmox node; updates hostname, /etc/hosts, /etc/pve/nodes/, and Postfix
+FORCE_NODE_RENAME="no"         # set to yes to allow node rename when the host is part of a cluster
 ```
 
 ## Package Installation
@@ -187,10 +195,15 @@ Accepted values:
 - `forward`
 - `disabled`
 
+Forward mode vars (required when `DNS_SERVER_TYPE=forward`):
+
+- `DNS_FORWARD_HOST` — upstream DNS resolver hostname or IP
+- `DNS_FORWARD_PORTS` — upstream DNS port (default: `53`)
+
 Behavior:
 
 - `local` configures BIND9 on LAN and localhost
-- `forward` disables local BIND9 and forwards DNS to a user-managed backend
+- `forward` disables local BIND9 and forwards DNS to a user-managed backend; requires `DNS_FORWARD_HOST`
 - `disabled` leaves local DNS off
 - If `forward` is selected but the backend is unset or unreachable, the script falls back to `local`
 
@@ -221,6 +234,11 @@ Accepted values:
 - `local`
 - `relay`
 - `disabled`
+
+Relay mode vars (required when `DHCP_SERVER_TYPE=relay`):
+
+- `DHCP_RELAY_HOST` — upstream DHCP server address
+- `DHCP_RELAY_INTERFACES` — interfaces to relay on (default: the resolved LAN bridge)
 
 Behavior:
 
@@ -295,7 +313,7 @@ The script configures nftables with:
 - IPv4 forwarding
 - IPv6 forwarding
 - IPv4 masquerading for LAN traffic to WAN
-- Optional NAT66 for ULA IPv6
+- Optional NAT66 for ULA IPv6 (`NAT66_ENABLE=yes` by default; set to `no` to disable)
 - WAN and LAN access for:
   - SSH `22`
   - HTTP `80`
@@ -451,7 +469,7 @@ Key paths:
 Notes:
 
 - Modified files are backed up before changes
-- `/mnt/Backups/proxmox/` is intended for a dedicated backup mount; override `BACKUP_BASE_DIR` if you want backups elsewhere
+- `/mnt/Backups/proxmox/` is intended for a dedicated backup mount; override `PROXMOX_BACKUP_BASE_DIR` if you want backups elsewhere
 - Backups are preserved during reset for manual recovery
 - Log output to files is plain text
 
