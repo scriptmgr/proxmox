@@ -82,7 +82,6 @@ Disabled by default unless explicitly enabled:
 - ISO downloads
 - LXC template downloads
 - ProxMenux download helper
-- Community post-install script download helper
 - SDN object creation
 
 ### Enabled by Default
@@ -356,7 +355,13 @@ It does **not** automatically apply interactive or site-specific choices such as
 
 ## Downloads
 
-ISO and template downloads are optional and disabled by default.
+ISO and template downloads are optional and disabled by default. Enable them with:
+
+```bash
+export DOWNLOAD_ISOS=yes
+export DOWNLOAD_TEMPLATES=yes
+./install.sh
+```
 
 Download behavior:
 
@@ -383,13 +388,11 @@ VMware ESXi is not auto-downloaded because of licensing restrictions.
 If enabled, the script downloads these tools locally and prints where to run them manually:
 
 - ProxMenux
-- Community Proxmox post-install script
 
-Enable them with:
+Enable with:
 
 ```bash
 export RUN_PROXMENUX=yes
-export RUN_POST_INSTALL=yes
 ./install.sh
 ```
 
@@ -403,7 +406,6 @@ The bootstrap does not execute third-party interactive scripts automatically.
 
 Notes:
 
-- `RUN_POST_INSTALL=yes` only downloads the community script for manual use; its safe non-interactive defaults are already built into `install.sh`
 - `RUN_PROXMENUX=yes` only downloads the ProxMenux installer; its monitor remains a separate manual web dashboard install and is not auto-enabled by this bootstrap
 
 ## State and Idempotency
