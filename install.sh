@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202606261332-git
+##@Version           :  202606261458-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  WTFPL
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202606261332-git"
+VERSION="202606261458-git"
 
 set -eo pipefail
 
@@ -78,12 +78,9 @@ FWD1="${FWD1:-1.1.1.1}"
 FWD2="${FWD2:-8.8.8.8}"
 FWD3="${FWD3:-4.4.4.4}"
 
-MAIL_RELAY_HOST="${MAIL_RELAY_HOST:-${SMTP_RELAY:-}}"
-MAIL_RELAY_PORT="${MAIL_RELAY_PORT:-${SMTP_PORT:-587}}"
-ROOT_MAIL_FORWARD="${ROOT_MAIL_FORWARD:-${ROOT_EMAIL:-root@localhost}}"
-SMTP_RELAY="$MAIL_RELAY_HOST"
-SMTP_PORT="$MAIL_RELAY_PORT"
-ROOT_EMAIL="$ROOT_MAIL_FORWARD"
+MAIL_RELAY_HOST="${MAIL_RELAY_HOST:-}"
+MAIL_RELAY_PORT="${MAIL_RELAY_PORT:-587}"
+ROOT_MAIL_FORWARD="${ROOT_MAIL_FORWARD:-root@${HOSTNAME}}"
 
 CONFIGURE_POSTFIX="${CONFIGURE_POSTFIX:-yes}"
 POSTFIX_SERVER_TYPE="${POSTFIX_SERVER_TYPE:-local}"
@@ -132,6 +129,8 @@ RUN_POST_INSTALL="${RUN_POST_INSTALL:-no}"
 CONFIGURE_SDN="${CONFIGURE_SDN:-no}"
 
 PROXMOX_FORCE_MODE=false
+PROXMOX_DEBUG=false
+PROXMOX_COLOR="auto"
 PROXMOX_CLEAR_STATE_TASK=""
 
 PROXMOX_PVE_MAJOR_VERSION=""
@@ -151,15 +150,35 @@ __log() {
 
 	echo "[${timestamp}] [${level}] ${msg}" >>"${PROXMOX_LOG_FILE}"
 
+	# Emit color only when NO_COLOR is unset, --color is not "no", and the output fd is a terminal
+	local use_color=false
+	if [ -z "${NO_COLOR:-}" ] && [ "${PROXMOX_COLOR:-auto}" != "no" ]; then
+		if [ "${PROXMOX_COLOR:-auto}" = "yes" ] || [ -t 1 ]; then
+			use_color=true
+		fi
+	fi
+
 	case "$level" in
 	ERROR | FATAL)
-		echo -e "\033[0;31m[${level}] ${msg}\033[0m" >&2
+		if $use_color; then
+			echo -e "\033[0;31m[${level}] ${msg}\033[0m" >&2
+		else
+			echo "[${level}] ${msg}" >&2
+		fi
 		;;
 	WARN)
-		echo -e "\033[0;33m[${level}] ${msg}\033[0m"
+		if $use_color; then
+			echo -e "\033[0;33m[${level}] ${msg}\033[0m"
+		else
+			echo "[${level}] ${msg}"
+		fi
 		;;
 	SUCCESS)
-		echo -e "\033[0;32m[${level}] ${msg}\033[0m"
+		if $use_color; then
+			echo -e "\033[0;32m[${level}] ${msg}\033[0m"
+		else
+			echo "[${level}] ${msg}"
+		fi
 		;;
 	*)
 		echo "[${level}] ${msg}"
@@ -495,7 +514,7 @@ __configure_nested_virtualization() {
 
 __postfix_relay_explicitly_configured() {
 	local name value
-	for name in POSTFIX_SMTP_RELAY MAIL_RELAY_HOST SMTP_RELAY; do
+	for name in POSTFIX_SMTP_RELAY MAIL_RELAY_HOST; do
 		if __runtime_env_has "$name"; then
 			value="${!name:-}"
 			[ "$value" = "mail.example.com" ] && continue
@@ -625,13 +644,6 @@ __derive_config_values() {
 	if [ -z "$WAN_V4_IP" ] && ip link show "$WAN_BR" >/dev/null 2>&1; then
 		WAN_V4_IP=$(ip -4 addr show "$WAN_BR" 2>/dev/null | awk '/inet / { sub(/\/.*/, "", $2); print $2; exit }')
 	fi
-
-	MAIL_RELAY_HOST="${MAIL_RELAY_HOST:-$SMTP_RELAY}"
-	MAIL_RELAY_PORT="${MAIL_RELAY_PORT:-$SMTP_PORT}"
-	ROOT_MAIL_FORWARD="${ROOT_MAIL_FORWARD:-$ROOT_EMAIL}"
-	SMTP_RELAY="$MAIL_RELAY_HOST"
-	SMTP_PORT="$MAIL_RELAY_PORT"
-	ROOT_EMAIL="$ROOT_MAIL_FORWARD"
 
 	POSTFIX_SMTP_RELAY="${POSTFIX_SMTP_RELAY:-$MAIL_RELAY_HOST}"
 	POSTFIX_SMTP_PORT="${POSTFIX_SMTP_PORT:-$MAIL_RELAY_PORT}"
@@ -1468,13 +1480,11 @@ ${wan_ip_current}/24"
 __create_config_file() {
 	__log_info "Creating configuration file: $PROXMOX_CONFIG_FILE"
 
-	local config_mail_relay_host config_smtp_relay config_postfix_smtp_relay
+	local config_mail_relay_host config_postfix_smtp_relay
 	config_mail_relay_host="${MAIL_RELAY_HOST}"
-	config_smtp_relay="${SMTP_RELAY}"
 	config_postfix_smtp_relay="${POSTFIX_SMTP_RELAY}"
-	[ "$config_mail_relay_host" = "mail.example.com" ] && config_mail_relay_host=""
-	[ "$config_smtp_relay" = "mail.example.com" ] && config_smtp_relay=""
-	[ "$config_postfix_smtp_relay" = "mail.example.com" ] && config_postfix_smtp_relay=""
+	if [ "$config_mail_relay_host" = "mail.example.com" ]; then config_mail_relay_host=""; fi
+	if [ "$config_postfix_smtp_relay" = "mail.example.com" ]; then config_postfix_smtp_relay=""; fi
 
 	cat >"$PROXMOX_CONFIG_FILE" <<-EOF
 		# Proxmox Bootstrap Configuration
@@ -1524,9 +1534,6 @@ __create_config_file() {
 		MAIL_RELAY_HOST="${config_mail_relay_host}"
 		MAIL_RELAY_PORT="${MAIL_RELAY_PORT}"
 		ROOT_MAIL_FORWARD="${ROOT_MAIL_FORWARD}"
-		SMTP_RELAY="${config_smtp_relay}"
-		SMTP_PORT="${SMTP_PORT}"
-		ROOT_EMAIL="${ROOT_EMAIL}"
 		CONFIGURE_POSTFIX="${CONFIGURE_POSTFIX}"
 		POSTFIX_SERVER_TYPE="${POSTFIX_SERVER_TYPE}"
 		POSTFIX_SMTP_RELAY="${config_postfix_smtp_relay}"
@@ -1757,6 +1764,7 @@ __reset_bootstrap() {
 	__log_success "Reset complete; backups preserved at $PROXMOX_BACKUP_DIR"
 }
 
+# Bootstrap/setup script — exempt from triple-sync (no man page or shell completions required)
 __usage() {
 	cat <<-EOF
 		Usage: $0 [options]
@@ -1767,6 +1775,9 @@ __usage() {
 		  --clear-state [task]   Clear all state or one task
 		  --reset                Remove managed configuration and state
 		  --force                Re-run tasks even when state says complete
+		  --debug                Enable debug output
+		  --color auto|yes|no    Control color output (default: auto)
+		  --version              Print version and exit
 		  --help                 Show this help
 	EOF
 }
@@ -1798,6 +1809,21 @@ __parse_args() {
 			;;
 		--force)
 			PROXMOX_FORCE_MODE=true
+			;;
+		--debug)
+			PROXMOX_DEBUG=true
+			;;
+		--color)
+			if [ "${2:-}" = "auto" ] || [ "${2:-}" = "yes" ] || [ "${2:-}" = "no" ]; then
+				PROXMOX_COLOR="$2"
+				shift
+			else
+				PROXMOX_COLOR="auto"
+			fi
+			;;
+		--version | -v)
+			printf '%s\n' "$VERSION"
+			exit 0
 			;;
 		--help | -h)
 			__usage
