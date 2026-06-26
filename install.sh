@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
-################################################################################
-# Proxmox VE Bootstrap Script
-# Version: 3.0.0
-# Description: Complete Proxmox VE setup with networking, DHCP, DNS, and SDN
-# Supports: Proxmox VE 7.x, 8.x, 9.x
-# License: MIT
-################################################################################
+# shellcheck shell=bash
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+##@Version           :  202606261332-git
+# @@Author           :  Jason Hempstead
+# @@Contact          :  git-admin@casjaysdev.pro
+# @@License          :  WTFPL
+# @@ReadME           :  install.sh --help
+# @@Copyright        :  Copyright: (c) 2025 Jason Hempstead, Casjays Developments
+# @@Created          :  Thursday, June 26, 2026 13:32 UTC
+# @@File             :  install.sh
+# @@Description      :  Complete Proxmox VE setup with networking, DHCP, DNS, and SDN
+# @@Changelog        :  Initial implementation
+# @@TODO             :  None
+# @@Other            :  Supports Proxmox VE 7.x, 8.x, 9.x
+# @@Resource         :  https://pve.proxmox.com/wiki/Main_Page
+# @@Terminal App     :  no
+# @@sudo/root        :  yes
+# @@Template         :  shell/bash
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+# shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+VERSION="202606261332-git"
 
-set -euo pipefail
+set -eo pipefail
 
 ################################################################################
 # CONFIGURATION VARIABLES
@@ -734,7 +749,7 @@ __derive_lan_network_values() {
 		fi
 	fi
 
-	third="$(echo "$LAN_V4_IP" | cut -d. -f3)"
+	IFS=. read -r _ _ third _ <<< "$LAN_V4_IP"
 	LAN_V6_PREFIX="${LAN_V6_PREFIX:-fd00:${third}::/64}"
 	LAN_V6_ROUTER_IP="${LAN_V6_ROUTER_IP:-fd00:${third}::1}"
 	LAN_V6_RANGE_LOW="${LAN_V6_RANGE_LOW:-fd00:${third}::200}"
@@ -974,7 +989,7 @@ __detect_pve_version() {
 	fi
 
 	local pve_version
-	pve_version=$(pveversion | head -n1 | cut -d'/' -f2 | cut -d'.' -f1)
+	pve_version=$(pveversion | awk -F/ 'NR==1{split($2,a,"."); print a[1]; exit}')
 	PROXMOX_PVE_MAJOR_VERSION="$pve_version"
 
 	if [ "$PROXMOX_PVE_MAJOR_VERSION" -lt 7 ]; then
@@ -1040,7 +1055,7 @@ __detect_network_interfaces() {
 	__log_info "Detecting network interfaces..."
 
 	local interfaces
-	interfaces=$(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -v -- '^lo$' | grep -Ev -- '^(vmbr|veth|tap|docker|pvedummy|pverouter)' || true)
+	interfaces=$(ip -o link show | awk -F': ' '{split($2,a,"@"); print a[1]}' | grep -v -- '^lo$' | grep -Ev -- '^(vmbr|veth|tap|docker|pvedummy|pverouter)' || true)
 
 	local nic_count
 	nic_count=$(printf '%s\n' "$interfaces" | sed '/^$/d' | wc -l)
@@ -1397,9 +1412,7 @@ __check_ip_conflicts() {
 
 	local candidate_prefix candidate_third existing_cidrs cidr wan_ip_current base_a base_b
 	candidate_prefix="${LAN_V4#*/}"
-	base_a="$(echo "${LAN_V4%%/*}" | cut -d. -f1)"
-	base_b="$(echo "${LAN_V4%%/*}" | cut -d. -f2)"
-	candidate_third="$(echo "${LAN_V4%%/*}" | cut -d. -f3)"
+	IFS=. read -r base_a base_b candidate_third _ <<< "${LAN_V4%%/*}"
 	existing_cidrs="$(ip -o -4 addr show 2>/dev/null | awk -v lan="$LAN_BR" '$2 != lan {print $4}' || true)"
 
 	wan_ip_current=$(ip -4 addr show "${WAN_BR}" 2>/dev/null | awk '/inet / { sub(/\/.*/, "", $2); print $2; exit }' || true)
@@ -2844,7 +2857,7 @@ __configure_dhcp() {
 	fi
 
 	cat >>/etc/dhcp/dhcpd.conf <<-EOF
-	subnet $(echo "$LAN_V4_NET" | cut -d/ -f1) netmask $(__netmask_from_prefix "${LAN_V4_NET#*/}") {
+	subnet ${LAN_V4_NET%%/*} netmask $(__netmask_from_prefix "${LAN_V4_NET#*/}") {
 	  range ${DHCP_V4_START} ${DHCP_V4_END};
 	  option routers ${LAN_V4_IP};
 	  option subnet-mask ${dhcp_subnet_mask:-$(__netmask_from_prefix "${LAN_V4_NET#*/}")};
