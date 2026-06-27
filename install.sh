@@ -2500,6 +2500,7 @@ __configure_nftables() {
 	    iifname "$WAN_BR" tcp dport 443 accept
 	    iifname "$WAN_BR" tcp dport 8006 accept
 	    iifname "$WAN_BR" tcp dport 3128 accept
+	    iifname "$WAN_BR" udp dport 60000-61000 accept
 	    ${wan_dns_input}
 
 	    ${wan_mail_input}
