@@ -165,8 +165,8 @@ Target bridge model:
 Behavior by host type:
 
 - **1 physical NIC**: preserve existing WAN behavior and add a dummy-backed LAN bridge plus a separate router-lab pair
-- **2 physical NICs**: preserve WAN and use the other NIC for LAN by default
-- **More than 2 physical NICs**: preserve WAN and default LAN to dummy-backed mode unless `LAN_NIC` is explicitly set
+- **2 physical NICs**: preserve WAN, use the other NIC for LAN, and also add a dummy-backed router-lab pair
+- **More than 2 physical NICs**: preserve WAN and default LAN to dummy-backed mode unless `LAN_NIC` is explicitly set; also add a router-lab pair
 
 Additional rules:
 

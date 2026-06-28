@@ -1210,9 +1210,8 @@ __resolve_router_lab_network() {
 		lan_dummy_idx="${LAN_NIC#pvedummy}"
 		;;
 	*)
-		ROUTER_NIC=""
-		ROUTER_BR=""
-		return 0
+		# LAN is a physical NIC; start router-lab index from pverouter1
+		lan_dummy_idx=0
 		;;
 	esac
 
