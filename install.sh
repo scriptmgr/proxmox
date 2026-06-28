@@ -1129,12 +1129,17 @@ __bridge_ports_for() {
 	' /etc/network/interfaces 2>/dev/null || true
 }
 
+__max_vmbr_idx() {
+	{
+		ip -o link show 2>/dev/null | awk -F': ' '{split($2,a,"@"); print a[1]}' | grep -E -- '^vmbr[0-9]+$' || true
+		grep -E -- '^(auto|iface)[[:space:]]+vmbr[0-9]+' /etc/network/interfaces 2>/dev/null | awk '{print $2}' | grep -E -- '^vmbr[0-9]+$' || true
+	} | awk -F'vmbr' 'BEGIN{m=0} {if ($2+0>m) m=$2+0} END{print m}'
+}
+
 __next_free_bridge() {
-	local idx=1
-	while ip link show "vmbr${idx}" >/dev/null 2>&1 || grep -qE -- "^(auto|iface)[[:space:]]+vmbr${idx}([[:space:]]|$)" /etc/network/interfaces 2>/dev/null; do
-		idx=$((idx + 1))
-	done
-	echo "vmbr${idx}"
+	local max
+	max="$(__max_vmbr_idx)"
+	echo "vmbr$((max + 1))"
 }
 
 __next_free_dummy() {
@@ -1176,11 +1181,11 @@ __resolve_lan_bridge() {
 }
 
 __next_free_bridge_from() {
-	local idx="$1"
-	while ip link show "vmbr${idx}" >/dev/null 2>&1 || grep -qE -- "^(auto|iface)[[:space:]]+vmbr${idx}([[:space:]]|$)" /etc/network/interfaces 2>/dev/null; do
-		idx=$((idx + 1))
-	done
-	echo "vmbr${idx}"
+	local start="$1" max result
+	max="$(__max_vmbr_idx)"
+	result=$((max + 1))
+	[ "$result" -lt "$start" ] && result="$start"
+	echo "vmbr${result}"
 }
 
 __router_bridge_uses_target_port() {
