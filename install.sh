@@ -2973,7 +2973,7 @@ __configure_radvd() {
 
 __configure_postfix() {
 	if ! __is_enabled "$CONFIGURE_POSTFIX"; then
-		return
+		return 0
 	fi
 
 	if [ "$POSTFIX_SERVER_TYPE" = "forward" ]; then
@@ -3427,7 +3427,7 @@ __configure_vm_defaults() {
 
 __download_templates() {
 	if ! __is_enabled "$DOWNLOAD_TEMPLATES"; then
-		return
+		return 0
 	fi
 
 	__log_info "Downloading LXC templates..."
@@ -3453,7 +3453,7 @@ __download_templates() {
 
 __download_isos() {
 	if ! __is_enabled "$DOWNLOAD_ISOS"; then
-		return
+		return 0
 	fi
 
 	__log_info "Downloading ISOs..."
