@@ -493,13 +493,13 @@ __configure_nested_virtualization() {
 	modprobe "$module" >/dev/null 2>&1 || true
 	nested_param="/sys/module/${module}/parameters/nested"
 	if [ -w "$nested_param" ]; then
-		current_value="$(< "$nested_param" 2>/dev/null || true)"
+		current_value="$(cat "$nested_param" 2>/dev/null || true)"
 		if [ "$current_value" != "$nested_value" ]; then
 			printf '%s' "$nested_value" >"$nested_param" 2>/dev/null || true
 		fi
 	fi
 
-	current_value="$(< "$nested_param" 2>/dev/null || true)"
+	current_value="$(cat "$nested_param" 2>/dev/null || true)"
 	case "$current_value" in
 	1 | Y | y)
 		__add_summary "Enabled nested virtualization for ${module}"
@@ -595,7 +595,7 @@ __persist_resolved_network_state() {
 	old_router_br="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "ROUTER_BR" || true)"
 	old_router_nic="$(__assignment_file_value "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "ROUTER_NIC" || true)"
 
-	mkdir -p "$(dirname "$PROXMOX_RESOLVED_NETWORK_STATE_FILE")"
+	mkdir -p "${PROXMOX_RESOLVED_NETWORK_STATE_FILE%/*}"
 	tmp_file="$(mktemp)"
 	cat >"$tmp_file" <<-EOF
 		LAN_BR="${LAN_BR}"
@@ -799,7 +799,7 @@ __backup_file() {
 	local file="$1"
 	if [ -f "$file" ]; then
 		local backup_path="${PROXMOX_BACKUP_DIR}${file}"
-		mkdir -p "$(dirname "$backup_path")"
+		mkdir -p "${backup_path%/*}"
 		cp -a "$file" "$backup_path"
 		__log_info "Backed up: $file"
 	fi
@@ -815,7 +815,7 @@ __check_root() {
 
 __warn_if_backup_parent_unmounted() {
 	local backup_parent
-	backup_parent="$(dirname "$PROXMOX_BACKUP_BASE_DIR")"
+	backup_parent="${PROXMOX_BACKUP_BASE_DIR%/*}"
 	[ -d "$backup_parent" ] || return 0
 	if ! mountpoint -q "$backup_parent" 2>/dev/null; then
 		__log_warn "Backup parent path ${backup_parent} is not a separate mount point; backups will be stored on the root filesystem unless you override PROXMOX_BACKUP_BASE_DIR"
@@ -1633,7 +1633,7 @@ __with_state_lock() {
 __write_task_state() {
 	local task="$1"
 	local tmp_file
-	mkdir -p "$(dirname "$PROXMOX_STATE_FILE")"
+	mkdir -p "${PROXMOX_STATE_FILE%/*}"
 	tmp_file="$(mktemp)"
 	if [ -f "$PROXMOX_STATE_FILE" ]; then
 		awk -F'|' -v task="$task" '$1 != task' "$PROXMOX_STATE_FILE" >"$tmp_file"
@@ -2774,8 +2774,7 @@ __configure_bind9() {
 	systemctl enable bind9 >/dev/null 2>&1 || true
 	systemctl restart bind9 || __log_fatal "Failed to start BIND9"
 
-	local bind_attempt
-	for bind_attempt in 1 2 3 4 5; do
+	for _ in 1 2 3 4 5; do
 		sleep 1
 		systemctl is-active --quiet bind9 && break
 	done
@@ -3191,16 +3190,30 @@ EOF
 __configure_nginx() {
 	__log_info "Configuring nginx..."
 
-	local fqdn nginx_ssl_cert nginx_ssl_key vhost_file mime_tmp
+	local fqdn le_dir proxmox_ssl_cert proxmox_ssl_key nginx_ssl_cert nginx_ssl_key vhost_file mime_tmp
 	fqdn="$(__get_host_fqdn)"
-	nginx_ssl_cert="/etc/pve/local/pve-ssl.pem"
-	nginx_ssl_key="/etc/pve/local/pve-ssl.key"
+	proxmox_ssl_cert="/etc/pve/local/pve-ssl.pem"
+	proxmox_ssl_key="/etc/pve/local/pve-ssl.key"
 	vhost_file="/etc/nginx/vhosts.d/${fqdn}.conf"
 	mime_tmp="/tmp/mime.types.$$"
 
+	le_dir=""
+	if [ -d "/etc/letsencrypt/live/domain" ]; then
+		le_dir="/etc/letsencrypt/live/domain"
+	elif [ -d "/etc/letsencrypt/live/${fqdn}" ]; then
+		le_dir="/etc/letsencrypt/live/${fqdn}"
+	fi
+
 	__command_exists nginx || __log_fatal "nginx is not installed"
-	[ -f "$nginx_ssl_cert" ] || __log_fatal "Missing Proxmox SSL certificate: $nginx_ssl_cert"
-	[ -f "$nginx_ssl_key" ] || __log_fatal "Missing Proxmox SSL key: $nginx_ssl_key"
+	[ -f "$proxmox_ssl_cert" ] || __log_fatal "Missing Proxmox SSL certificate: $proxmox_ssl_cert"
+	[ -f "$proxmox_ssl_key" ] || __log_fatal "Missing Proxmox SSL key: $proxmox_ssl_key"
+
+	nginx_ssl_cert="$proxmox_ssl_cert"
+	nginx_ssl_key="$proxmox_ssl_key"
+	if [ -n "$le_dir" ] && [ -f "${le_dir}/fullchain.pem" ] && [ -f "${le_dir}/privkey.pem" ]; then
+		nginx_ssl_cert="${le_dir}/fullchain.pem"
+		nginx_ssl_key="${le_dir}/privkey.pem"
+	fi
 
 	if [ -d /etc/nginx ]; then
 		mkdir -p "${PROXMOX_BACKUP_DIR}/etc"
@@ -3225,9 +3238,9 @@ __configure_nginx() {
 		                  '"$http_user_agent" "$http_x_forwarded_for"';
 	EOF
 
-	cat >/etc/nginx/conf.d/default.conf <<-'EOF'
-		map $http_upgrade $connection_upgrade { default upgrade; '' close; }
-		upstream pveproxy { server 127.0.0.1:8006 fail_timeout=0; }
+	cat >/etc/nginx/conf.d/default.conf <<-EOF
+		map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+		upstream pveproxy { server ${fqdn}:8006 fail_timeout=0; }
 	EOF
 
 	cat >/etc/nginx/nginx.conf <<-'EOF'
@@ -3383,7 +3396,8 @@ __configure_vm_defaults() {
 		for conf in /etc/pve/qemu-server/*.conf; do
 			[ -f "$conf" ] || continue
 			local vmid net_count net_line net_value updated_value
-			vmid=$(basename "$conf" .conf)
+			vmid="${conf##*/}"
+			vmid="${vmid%.conf}"
 			net_count="$(grep -cE -- '^net[0-9]+:' "$conf" 2>/dev/null || true)"
 			if [ "$net_count" -eq 1 ]; then
 				net_line="$(grep -E -- '^net[0-9]+:' "$conf" | head -n1)"
@@ -3404,7 +3418,8 @@ __configure_vm_defaults() {
 		for conf in /etc/pve/lxc/*.conf; do
 			[ -f "$conf" ] || continue
 			local ctid net_count net_line net_value updated_value
-			ctid=$(basename "$conf" .conf)
+			ctid="${conf##*/}"
+			ctid="${ctid%.conf}"
 			net_count="$(grep -cE -- '^net[0-9]+:' "$conf" 2>/dev/null || true)"
 			if [ "$net_count" -eq 1 ]; then
 				net_line="$(grep -E -- '^net[0-9]+:' "$conf" | head -n1)"
@@ -3603,6 +3618,9 @@ __download_proxmenux_tool() {
 
 __main() {
 	__parse_args "$@"
+	if [ "$PROXMOX_DEBUG" = "true" ]; then
+		set -x
+	fi
 	__check_root
 
 	mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
