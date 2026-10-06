@@ -22,7 +22,7 @@ The project spec lives in [`AI.md`](AI.md). When this README and the implementat
 ## Supported Versions
 
 - Compatibility target: Proxmox VE 7.x, 8.x, 9.x
-- Active test target: `rtedpro/proxmox:9.1.9`
+- Active test target: `rtedpro/proxmox:latest`
 
 ## Quick Start
 
@@ -482,7 +482,7 @@ Notes:
 Primary test target:
 
 ```bash
-docker run -itd --name proxmoxve --hostname pve -p 8006:8006 --privileged rtedpro/proxmox:9.1.9
+docker run -itd --name proxmoxve --hostname pve -p 8006:8006 --privileged rtedpro/proxmox:latest
 ```
 
 Project verification should execute `install.sh` inside the declared Proxmox test container, not on the host.
