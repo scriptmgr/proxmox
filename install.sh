@@ -215,89 +215,6 @@ __command_exists() {
 	command -v "$1" >/dev/null 2>&1
 }
 
-__assignment_file_value() {
-	local file="$1"
-	local name="$2"
-	[ -f "$file" ] || return 1
-
-	awk -F= -v key="$name" '
-		{
-			line = $0
-			sub(/^[[:space:]]*export[[:space:]]+/, "", line)
-			split(line, parts, "=")
-			if (parts[1] == key) {
-				sub(/^[^=]*=/, "", line)
-				gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-				if ((line ~ /^".*"$/) || (line ~ /^'\''.*'\''$/)) {
-					line = substr(line, 2, length(line) - 2)
-				}
-				print line
-				exit
-			}
-		}
-	' "$file"
-}
-
-__resolved_network_override_supplied() {
-	local name="$1"
-	local default_value="$2"
-	local file value
-
-	if __runtime_env_has "$name"; then
-		return 0
-	fi
-
-	for file in "$PROXMOX_CONFIG_FILE" "$PROXMOX_ENV_FILE"; do
-		value="$(__assignment_file_value "$file" "$name" || true)"
-		[ -n "$value" ] || continue
-		if [ "$value" != "$default_value" ]; then
-			return 0
-		fi
-	done
-
-	return 1
-}
-
-__runtime_env_has() {
-	local name="$1"
-	case "
-${PROXMOX_ORIGINAL_ENV_KEYS}
-" in
-	*"
-${name}
-"*)
-		return 0
-		;;
-	*)
-		return 1
-		;;
-	esac
-}
-
-__load_assignment_file() {
-	local file="$1"
-	[ -f "$file" ] || return 0
-
-	local tmp_file line var
-	tmp_file="$(mktemp)"
-	while IFS= read -r line || [ -n "$line" ]; do
-		case "$line" in
-		'' | \#*) continue ;;
-		esac
-		var="${line%%=*}"
-		var="${var#export }"
-		if [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && ! __runtime_env_has "$var"; then
-			printf '%s\n' "$line" >>"$tmp_file"
-		fi
-	done <"$file"
-
-	if [ -s "$tmp_file" ]; then
-		# shellcheck disable=SC1090
-		. "$tmp_file"
-	fi
-	rm -f "$tmp_file"
-}
-
 __is_enabled() {
 	case "${1:-}" in
 	[yY] | [yY][eE][sS] | [tT][rR][uU][eE] | 1 | [oO][nN])
@@ -456,58 +373,560 @@ __reverse_ptr_owner() {
 	esac
 }
 
-__kernel_version_from_package() {
-	local pkg="$1"
-	pkg="${pkg#proxmox-kernel-}"
-	pkg="${pkg#pve-kernel-}"
-	pkg="${pkg%-signed}"
-	echo "$pkg"
+__split_csv_ports() {
+	echo "${1:-}" | tr ',' ' ' | awk 'NF'
 }
 
-__list_installed_pve_kernel_packages() {
-	dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E -- '^(proxmox|pve)-kernel-[0-9].*-pve(-signed)?$' || true
+__comma_list_ports() {
+	echo "${1:-}" | sed 's/[[:space:]]//g' | sed 's/,/, /g'
 }
 
-__configure_nested_virtualization() {
-	if ! __is_enabled "$ENABLE_NESTED_VIRT"; then
-		return 0
+__backup_file() {
+	local file="$1"
+	if [ -f "$file" ]; then
+		local backup_path="${PROXMOX_BACKUP_DIR}${file}"
+		mkdir -p "${backup_path%/*}"
+		cp -a "$file" "$backup_path"
+		__log_info "Backed up: $file"
+	fi
+}
+
+__check_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		__log_fatal "This script must be run as root"
+	fi
+	export DEBIAN_FRONTEND=noninteractive
+	mkdir -p /var/tmp
+}
+
+__warn_if_backup_parent_unmounted() {
+	local backup_parent
+	backup_parent="${PROXMOX_BACKUP_BASE_DIR%/*}"
+	[ -d "$backup_parent" ] || return 0
+	if ! mountpoint -q "$backup_parent" 2>/dev/null; then
+		__log_warn "Backup parent path ${backup_parent} is not a separate mount point; backups will be stored on the root filesystem unless you override PROXMOX_BACKUP_BASE_DIR"
+	fi
+}
+
+__run_apt_noninteractive() {
+	local attempt rc log_file policy_rc backup_policy_rc restore_backup=0
+	log_file="$(mktemp)"
+	policy_rc="/usr/sbin/policy-rc.d"
+	backup_policy_rc="$(mktemp)"
+
+	if [ -e "$policy_rc" ]; then
+		cp -a "$policy_rc" "$backup_policy_rc"
+		restore_backup=1
 	fi
 
-	local module nested_value nested_param current_value
-	module=""
-	nested_value=""
-	if grep -qi -- 'AuthenticAMD' /proc/cpuinfo 2>/dev/null; then
-		module="kvm_amd"
-		nested_value="1"
-	elif grep -qi -- 'GenuineIntel' /proc/cpuinfo 2>/dev/null; then
-		module="kvm_intel"
-		nested_value="Y"
+	cat >"$policy_rc" <<-'EOF'
+		#!/bin/sh
+		exit 101
+	EOF
+	chmod 755 "$policy_rc"
+
+	for attempt in 1 2 3; do
+		if TMPDIR=/var/tmp DEBIAN_FRONTEND=noninteractive "$@" >"$log_file" 2>&1; then
+			if [ "$restore_backup" -eq 1 ]; then
+				mv "$backup_policy_rc" "$policy_rc"
+			else
+				rm -f "$policy_rc" "$backup_policy_rc"
+			fi
+			rm -f "$log_file"
+			return 0
+		fi
+
+		rc=$?
+		if grep -qE -- "cannot stat pathname '.*/apt-dpkg-install-" "$log_file"; then
+			__log_warn "apt/dpkg temporary file race detected; retrying (${attempt}/3)"
+			TMPDIR=/var/tmp DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+			TMPDIR=/var/tmp DEBIAN_FRONTEND=noninteractive apt-get -f install -y \
+				-o Dpkg::Options::="--force-confdef" \
+				-o Dpkg::Options::="--force-confold" >/dev/null 2>&1 || true
+			apt-get clean >/dev/null 2>&1 || true
+			continue
+		fi
+
+		break
+	done
+
+	cat "$log_file" >>"$PROXMOX_LOG_FILE"
+	if [ "$restore_backup" -eq 1 ]; then
+		mv "$backup_policy_rc" "$policy_rc"
 	else
-		return 0
+		rm -f "$policy_rc" "$backup_policy_rc"
 	fi
+	rm -f "$log_file"
+	return "${rc:-1}"
+}
 
-	mkdir -p /etc/modprobe.d
-	__backup_file /etc/modprobe.d/proxmox-bootstrap-kvm.conf
-	printf 'options %s nested=%s\n' "$module" "$nested_value" >/etc/modprobe.d/proxmox-bootstrap-kvm.conf
+__unmask_service_if_needed() {
+	local service="$1"
+	if [ "$(systemctl is-enabled "$service" 2>/dev/null || true)" = "masked" ]; then
+		systemctl unmask "$service" >/dev/null 2>&1 || __log_warn "Could not unmask ${service}"
+	fi
+}
 
-	modprobe "$module" >/dev/null 2>&1 || true
-	nested_param="/sys/module/${module}/parameters/nested"
-	if [ -w "$nested_param" ]; then
-		current_value="$(cat "$nested_param" 2>/dev/null || true)"
-		if [ "$current_value" != "$nested_value" ]; then
-			printf '%s' "$nested_value" >"$nested_param" 2>/dev/null || true
+__enable_restart_service() {
+	local service="$1" level="${2:-fatal}" message="${3:-Failed to restart ${1}}"
+	__unmask_service_if_needed "$service"
+	systemctl enable "$service" >/dev/null 2>&1 || true
+	if ! systemctl restart "$service"; then
+		if [ "$level" = "warn" ]; then
+			__log_warn "$message"
+		else
+			__log_fatal "$message"
 		fi
 	fi
+}
 
-	current_value="$(cat "$nested_param" 2>/dev/null || true)"
-	case "$current_value" in
-	1 | Y | y)
-		__add_summary "Enabled nested virtualization for ${module}"
+################################################################################
+# CONFIGURATION FILE MANAGEMENT
+################################################################################
+
+__create_config_file() {
+	__log_info "Creating configuration file: $PROXMOX_CONFIG_FILE"
+
+	local config_mail_relay_host config_postfix_smtp_relay
+	config_mail_relay_host="${MAIL_RELAY_HOST}"
+	config_postfix_smtp_relay="${POSTFIX_SMTP_RELAY}"
+	if [ "$config_mail_relay_host" = "mail.example.com" ]; then config_mail_relay_host=""; fi
+	if [ "$config_postfix_smtp_relay" = "mail.example.com" ]; then config_postfix_smtp_relay=""; fi
+
+	cat >"$PROXMOX_CONFIG_FILE" <<-EOF
+		# Proxmox Bootstrap Configuration
+		# Generated: $(date)
+		# Version: $PROXMOX_SCRIPT_VERSION
+
+		# Network Configuration
+		WAN_NIC="${WAN_NIC}"
+		LAN_NIC="${LAN_NIC}"
+		ROUTER_NIC="${ROUTER_NIC}"
+		WAN_BR="${WAN_BR}"
+		LAN_BR="${LAN_BR}"
+		ROUTER_BR="${ROUTER_BR}"
+
+		# WAN IPv4
+		WAN_V4="${WAN_V4}"
+		WAN_V4_GW="${WAN_V4_GW}"
+		WAN_V4_BRD="${WAN_V4_BRD}"
+
+		# WAN IPv6
+		WAN_V6="${WAN_V6}"
+		WAN_V6_GW="${WAN_V6_GW}"
+
+		# LAN IPv4
+		LAN_V4="${LAN_V4}"
+		LAN_V4_BRD="${LAN_V4_BRD}"
+		LAN_V4_NET="${LAN_V4_NET}"
+		DHCP_V4_START="${DHCP_V4_START}"
+		DHCP_V4_END="${DHCP_V4_END}"
+		LAN_DOMAIN="${LAN_DOMAIN}"
+
+		# LAN IPv6
+		LAN_V6_PREFIX="${LAN_V6_PREFIX}"
+		LAN_V6_ROUTER_IP="${LAN_V6_ROUTER_IP}"
+		LAN_V6_STATEFUL="${LAN_V6_STATEFUL}"
+		LAN_V6_RANGE_LOW="${LAN_V6_RANGE_LOW}"
+		LAN_V6_RANGE_HIGH="${LAN_V6_RANGE_HIGH}"
+		LAN_IPV6_IS_ULA="${LAN_IPV6_IS_ULA}"
+		NAT66_ENABLE="${NAT66_ENABLE}"
+
+		# DNS Forwarders
+		FWD1="${FWD1}"
+		FWD2="${FWD2}"
+		FWD3="${FWD3}"
+
+		# Mail Configuration
+		MAIL_RELAY_HOST="${config_mail_relay_host}"
+		MAIL_RELAY_PORT="${MAIL_RELAY_PORT}"
+		ROOT_MAIL_FORWARD="${ROOT_MAIL_FORWARD}"
+		CONFIGURE_POSTFIX="${CONFIGURE_POSTFIX}"
+		POSTFIX_SERVER_TYPE="${POSTFIX_SERVER_TYPE}"
+		POSTFIX_SMTP_RELAY="${config_postfix_smtp_relay}"
+		POSTFIX_SMTP_PORT="${POSTFIX_SMTP_PORT}"
+		POSTFIX_FROM_EMAIL="${POSTFIX_FROM_EMAIL}"
+		POSTFIX_FROM_NAME="${POSTFIX_FROM_NAME}"
+		POSTFIX_ROOT_FORWARD="${POSTFIX_ROOT_FORWARD}"
+		POSTFIX_MYHOSTNAME="${POSTFIX_MYHOSTNAME}"
+		POSTFIX_MYDOMAIN="${POSTFIX_MYDOMAIN}"
+		POSTFIX_RELAY_TLS="${POSTFIX_RELAY_TLS}"
+		POSTFIX_RELAY_USERNAME="${POSTFIX_RELAY_USERNAME}"
+		POSTFIX_RELAY_PASSWORD="${POSTFIX_RELAY_PASSWORD}"
+		POSTFIX_WAN_ENABLE="${POSTFIX_WAN_ENABLE}"
+		POSTFIX_FORWARD_HOST="${POSTFIX_FORWARD_HOST}"
+		POSTFIX_FORWARD_PORTS="${POSTFIX_FORWARD_PORTS}"
+
+		# DNS/DHCP/RA Service Modes
+		DNS_SERVER_TYPE="${DNS_SERVER_TYPE}"
+		DNS_FORWARD_HOST="${DNS_FORWARD_HOST}"
+		DNS_FORWARD_PORTS="${DNS_FORWARD_PORTS}"
+		DNS_SPLIT_ENABLE="${DNS_SPLIT_ENABLE}"
+		DNS_WAN_ENABLE="${DNS_WAN_ENABLE}"
+		DNS_WAN_ZONE="${DNS_WAN_ZONE}"
+		DNS_WAN_RECORDS_FILE="${DNS_WAN_RECORDS_FILE}"
+		DNS_LAN_RECURSION="${DNS_LAN_RECURSION}"
+		DNS_WAN_RECURSION="${DNS_WAN_RECURSION}"
+		DHCP_SERVER_TYPE="${DHCP_SERVER_TYPE}"
+		DHCP_RELAY_HOST="${DHCP_RELAY_HOST}"
+		DHCP_RELAY_INTERFACES="${DHCP_RELAY_INTERFACES}"
+		RA_SERVER_TYPE="${RA_SERVER_TYPE}"
+
+		# Node/Guest Defaults
+		PVE_NODE_NAME="${PVE_NODE_NAME}"
+		FORCE_NODE_RENAME="${FORCE_NODE_RENAME}"
+		GUEST_DEFAULT_BRIDGE="${GUEST_DEFAULT_BRIDGE}"
+
+		# Feature Flags
+		DOWNLOAD_ISOS="${DOWNLOAD_ISOS}"
+		DOWNLOAD_TEMPLATES="${DOWNLOAD_TEMPLATES}"
+		RUN_PROXMENUX="${RUN_PROXMENUX}"
+		CONFIGURE_SDN="${CONFIGURE_SDN}"
+		DISABLE_SUBSCRIPTION_NAG="${DISABLE_SUBSCRIPTION_NAG}"
+		AUTO_DIST_UPGRADE="${AUTO_DIST_UPGRADE}"
+		PIN_NEWEST_PVE_KERNEL="${PIN_NEWEST_PVE_KERNEL}"
+		PVE_KERNEL_KEEP_COUNT="${PVE_KERNEL_KEEP_COUNT}"
+		ENABLE_NESTED_VIRT="${ENABLE_NESTED_VIRT}"
+	EOF
+
+	chown root:root "$PROXMOX_CONFIG_FILE"
+	chmod 600 "$PROXMOX_CONFIG_FILE"
+	__log_success "Configuration file created"
+}
+
+__load_config_file() {
+	if [ -f "$PROXMOX_CONFIG_FILE" ]; then
+		__log_info "Loading configuration from: $PROXMOX_CONFIG_FILE"
+		__load_assignment_file "$PROXMOX_CONFIG_FILE"
+	fi
+	if [ -f "$PROXMOX_ENV_FILE" ]; then
+		__log_info "Loading environment overrides from: $PROXMOX_ENV_FILE"
+		__load_assignment_file "$PROXMOX_ENV_FILE"
+	fi
+	__load_resolved_network_state
+	__derive_config_values
+}
+
+__state_task_done() {
+	local task="$1"
+	[ -f "$PROXMOX_STATE_FILE" ] || return 1
+	awk -F'|' -v task="$task" '$1 == task { found = 1; exit 0 } END { exit(found ? 0 : 1) }' "$PROXMOX_STATE_FILE"
+}
+
+__with_state_lock() {
+	local lock_file lock_dir
+	local rc
+	lock_file="${PROXMOX_STATE_FILE}.lock"
+	lock_dir="${lock_file}.d"
+
+	if __command_exists flock; then
+		(
+			flock -x 9
+			"$@"
+		) 9>"$lock_file"
+	else
+		while ! mkdir "$lock_dir" 2>/dev/null; do
+			sleep 0.1
+		done
+		"$@"
+		rc=$?
+		rmdir "$lock_dir"
+		return "$rc"
+	fi
+}
+
+__write_task_state() {
+	local task="$1"
+	local tmp_file
+	mkdir -p "${PROXMOX_STATE_FILE%/*}"
+	tmp_file="$(mktemp)"
+	if [ -f "$PROXMOX_STATE_FILE" ]; then
+		awk -F'|' -v task="$task" '$1 != task' "$PROXMOX_STATE_FILE" >"$tmp_file"
+	fi
+	printf '%s|%s\n' "$task" "$(date '+%Y-%m-%d %H:%M:%S')" >>"$tmp_file"
+	mv "$tmp_file" "$PROXMOX_STATE_FILE"
+}
+
+__remove_task_state() {
+	local task="$1"
+	local tmp_file
+	tmp_file="$(mktemp)"
+	awk -F'|' -v task="$task" '$1 != task' "$PROXMOX_STATE_FILE" >"$tmp_file"
+	mv "$tmp_file" "$PROXMOX_STATE_FILE"
+}
+
+__mark_task_done() {
+	local task="$1"
+	__with_state_lock __write_task_state "$task"
+}
+
+__run_task() {
+	local task="$1"
+	local fn="$2"
+
+	if ! $PROXMOX_FORCE_MODE && __state_task_done "$task"; then
+		__log_info "Skipping completed task: $task"
+		return 0
+	fi
+
+	"$fn"
+	__mark_task_done "$task"
+}
+
+__show_status() {
+	if [ ! -f "$PROXMOX_STATE_FILE" ]; then
+		echo "No completed tasks recorded."
+		return 0
+	fi
+
+	echo "Completed tasks:"
+	while IFS='|' read -r task completed_at; do
+		[ -n "$task" ] || continue
+		echo "  - $task (completed: $completed_at)"
+	done <"$PROXMOX_STATE_FILE"
+}
+
+__clear_state() {
+	local task="${1:-}"
+
+	if [ -z "$task" ]; then
+		rm -f "$PROXMOX_STATE_FILE"
+		rm -f "${PROXMOX_STATE_FILE}.lock"
+		rmdir "${PROXMOX_STATE_FILE}.lock.d" 2>/dev/null || true
+		echo "Cleared all state."
+		return 0
+	fi
+
+	if [ ! -f "$PROXMOX_STATE_FILE" ]; then
+		echo "No state file exists."
+		return 0
+	fi
+
+	__with_state_lock __remove_task_state "$task"
+	echo "Cleared state for task: $task"
+}
+
+__reset_bootstrap() {
+	mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
+	__log_warn "Resetting Proxmox bootstrap-managed configuration"
+
+	local file
+	local -a packages
+	for file in \
+		/etc/nftables.conf \
+		/etc/bind/named.conf \
+		/etc/bind/zones.conf \
+		/etc/bind/dhcp.key \
+		/etc/bind/rndc.key \
+		/etc/dhcp/dhcpd.conf \
+		/etc/dhcp/dhcpd6.conf \
+		/etc/default/isc-dhcp-server \
+		/etc/default/isc-dhcp-relay \
+		/etc/radvd.conf \
+		/etc/sysctl.d/99-proxmox-bootstrap.conf \
+		/etc/apt/apt.conf.d/99-proxmox-bootstrap-firmware-warning \
+		/etc/apt/apt.conf.d/99-proxmox-bootstrap-disable-nag \
+		/usr/local/sbin/proxmox-bootstrap-disable-nag \
+		/etc/modprobe.d/proxmox-bootstrap-kvm.conf \
+		/etc/letsencrypt/renewal-hooks/deploy/proxmox-bootstrap-copy-pve-cert \
+		/etc/nginx/nginx.conf \
+		/etc/proxmox-bootstrap.conf; do
+		__backup_file "$file"
+		rm -f "$file"
+	done
+
+	if [ -d /etc/pve/sdn ]; then
+		__backup_file /etc/pve/sdn/sdn.cfg
+		__backup_file /etc/pve/sdn/ipam.cfg
+		rm -f /etc/pve/sdn/sdn.cfg /etc/pve/sdn/ipam.cfg
+	fi
+
+	if [ -d "$PROXMOX_OPTIONAL_TOOLS_DIR" ]; then
+		mkdir -p "${PROXMOX_BACKUP_DIR}${PROXMOX_OPTIONAL_TOOLS_DIR}"
+		cp -a "$PROXMOX_OPTIONAL_TOOLS_DIR"/. "${PROXMOX_BACKUP_DIR}${PROXMOX_OPTIONAL_TOOLS_DIR}/" 2>/dev/null || true
+		rm -rf "$PROXMOX_OPTIONAL_TOOLS_DIR"
+	fi
+
+	rm -f /etc/fail2ban/jail.d/proxmox-bootstrap.conf
+	rm -f /etc/modules-load.d/proxmox-bootstrap.conf
+	rm -rf /etc/systemd/system/named.service.d
+	if [ -d /etc/nginx ]; then
+		mkdir -p "${PROXMOX_BACKUP_DIR}/etc"
+		cp -a /etc/nginx "${PROXMOX_BACKUP_DIR}/etc/" 2>/dev/null || true
+		find /etc/nginx -mindepth 1 ! -name mime.types -exec rm -rf {} +
+	fi
+
+	systemctl disable --now bind9 isc-dhcp-server isc-dhcp-relay radvd postfix nftables fail2ban nginx >/dev/null 2>&1 || true
+
+	packages=(
+		bind9 bind9-utils dnsutils isc-dhcp-server isc-dhcp-relay radvd postfix
+		mailutils fail2ban apparmor-utils libpve-network-perl nginx
+	)
+	DEBIAN_FRONTEND=noninteractive apt-get purge -y "${packages[@]}" >/dev/null 2>&1 || __log_warn "Some bootstrap-managed packages could not be purged"
+	DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
+
+	rm -f "$PROXMOX_STATE_FILE"
+	rm -f "$PROXMOX_RESOLVED_NETWORK_STATE_FILE"
+	__log_success "Reset complete; backups preserved at $PROXMOX_BACKUP_DIR"
+}
+
+# Bootstrap/setup script — exempt from triple-sync (no man page or shell completions required)
+__usage() {
+	cat <<-EOF
+		Usage: $0 [options]
+
+		Options:
+		  --init                 Create $PROXMOX_CONFIG_FILE and exit
+		  --status               Show completed bootstrap tasks
+		  --clear-state [task]   Clear all state or one task
+		  --reset                Remove managed configuration and state
+		  --force                Re-run tasks even when state says complete
+		  --debug                Enable debug output
+		  --color auto|yes|no    Control color output (default: auto)
+		  --version              Print version and exit
+		  --help                 Show this help
+	EOF
+}
+
+__parse_args() {
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--init)
+			mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
+			__load_config_file
+			__detect_network_interfaces
+			__derive_config_values
+			__create_config_file
+			exit 0
+			;;
+		--status)
+			__show_status
+			exit 0
+			;;
+		--clear-state)
+			if [ "${2:-}" != "" ] && [ "${2#--}" = "$2" ]; then
+				PROXMOX_CLEAR_STATE_TASK="$2"
+				shift
+			fi
+			__clear_state "$PROXMOX_CLEAR_STATE_TASK"
+			exit 0
+			;;
+		--reset)
+			__reset_bootstrap
+			exit 0
+			;;
+		--force)
+			PROXMOX_FORCE_MODE=true
+			;;
+		--debug)
+			PROXMOX_DEBUG=true
+			;;
+		--color)
+			if [ "${2:-}" = "auto" ] || [ "${2:-}" = "yes" ] || [ "${2:-}" = "no" ]; then
+				PROXMOX_COLOR="$2"
+				shift
+			else
+				PROXMOX_COLOR="auto"
+			fi
+			;;
+		--version | -v)
+			printf '%s\n' "$VERSION"
+			exit 0
+			;;
+		--help | -h)
+			__usage
+			exit 0
+			;;
+		*)
+			__usage >&2
+			exit 2
+			;;
+		esac
+		shift
+	done
+}
+
+__assignment_file_value() {
+	local file="$1"
+	local name="$2"
+	[ -f "$file" ] || return 1
+
+	awk -F= -v key="$name" '
+		{
+			line = $0
+			sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+			split(line, parts, "=")
+			if (parts[1] == key) {
+				sub(/^[^=]*=/, "", line)
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+				if ((line ~ /^".*"$/) || (line ~ /^'\''.*'\''$/)) {
+					line = substr(line, 2, length(line) - 2)
+				}
+				print line
+				exit
+			}
+		}
+	' "$file"
+}
+
+__resolved_network_override_supplied() {
+	local name="$1"
+	local default_value="$2"
+	local file value
+
+	if __runtime_env_has "$name"; then
+		return 0
+	fi
+
+	for file in "$PROXMOX_CONFIG_FILE" "$PROXMOX_ENV_FILE"; do
+		value="$(__assignment_file_value "$file" "$name" || true)"
+		[ -n "$value" ] || continue
+		if [ "$value" != "$default_value" ]; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+__runtime_env_has() {
+	local name="$1"
+	case "
+${PROXMOX_ORIGINAL_ENV_KEYS}
+" in
+	*"
+${name}
+"*)
+		return 0
 		;;
 	*)
-		__log_warn "Nested virtualization for ${module} is configured but may require a reboot or module reload"
+		return 1
 		;;
 	esac
+}
+
+__load_assignment_file() {
+	local file="$1"
+	[ -f "$file" ] || return 0
+
+	local tmp_file line var
+	tmp_file="$(mktemp)"
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in
+		'' | \#*) continue ;;
+		esac
+		var="${line%%=*}"
+		var="${var#export }"
+		if [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && ! __runtime_env_has "$var"; then
+			printf '%s\n' "$line" >>"$tmp_file"
+		fi
+	done <"$file"
+
+	if [ -s "$tmp_file" ]; then
+		# shellcheck disable=SC1090
+		. "$tmp_file"
+	fi
+	rm -f "$tmp_file"
 }
 
 __postfix_relay_explicitly_configured() {
@@ -528,14 +947,6 @@ __postfix_relay_explicitly_configured() {
 		fi
 	done
 	return 1
-}
-
-__split_csv_ports() {
-	echo "${1:-}" | tr ',' ' ' | awk 'NF'
-}
-
-__comma_list_ports() {
-	echo "${1:-}" | sed 's/[[:space:]]//g' | sed 's/,/, /g'
 }
 
 __load_resolved_network_state() {
@@ -795,171 +1206,456 @@ __validate_dhcp_v4_range() {
 	fi
 }
 
-__backup_file() {
-	local file="$1"
-	if [ -f "$file" ]; then
-		local backup_path="${PROXMOX_BACKUP_DIR}${file}"
-		mkdir -p "${backup_path%/*}"
-		cp -a "$file" "$backup_path"
-		__log_info "Backed up: $file"
+################################################################################
+# REPOSITORY CONFIGURATION
+################################################################################
+
+__configure_repositories() {
+	__log_info "Configuring Proxmox repositories..."
+
+	PROXMOX_DEBIAN_CODENAME=$(__get_debian_codename)
+	__log_info "Detected: Proxmox VE $PROXMOX_PVE_MAJOR_VERSION (Debian $PROXMOX_DEBIAN_CODENAME)"
+
+	if [ "$PROXMOX_PVE_MAJOR_VERSION" -ge 9 ]; then
+		__configure_repositories_deb822
+	else
+		__configure_repositories_legacy
 	fi
+	__configure_firmware_warning_suppression
+
+	__log_info "Updating package lists..."
+	DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1 || {
+		__log_error "Failed to update package lists"
+		return 1
+	}
+
+	__log_success "Repositories configured"
+	__add_summary "Configured Proxmox repositories with no-subscription defaults"
 }
 
-__check_root() {
-	if [ "$(id -u)" -ne 0 ]; then
-		__log_fatal "This script must be run as root"
-	fi
-	export DEBIAN_FRONTEND=noninteractive
-	mkdir -p /var/tmp
-}
-
-__warn_if_backup_parent_unmounted() {
-	local backup_parent
-	backup_parent="${PROXMOX_BACKUP_BASE_DIR%/*}"
-	[ -d "$backup_parent" ] || return 0
-	if ! mountpoint -q "$backup_parent" 2>/dev/null; then
-		__log_warn "Backup parent path ${backup_parent} is not a separate mount point; backups will be stored on the root filesystem unless you override PROXMOX_BACKUP_BASE_DIR"
-	fi
-}
-
-__get_host_fqdn() {
-	local fqdn
-	fqdn="$(hostname -f 2>/dev/null || true)"
-	if [ -n "$fqdn" ] && printf '%s' "$fqdn" | grep -q -- '\.'; then
-		echo "$fqdn"
-		return 0
-	fi
-	if [ -n "${PVE_NODE_NAME:-}" ] && [ -n "${LAN_DOMAIN:-}" ]; then
-		echo "${PVE_NODE_NAME}.${LAN_DOMAIN}"
-		return 0
-	fi
-	echo "$(__get_pve_node_name).${LAN_DOMAIN}"
-}
-
-__configure_letsencrypt_pve_cert_hook() {
-	local fqdn hook_dir hook_file le_dir
-	fqdn="$(__get_host_fqdn)"
-	hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
-	hook_file="${hook_dir}/proxmox-bootstrap-copy-pve-cert"
-	le_dir=""
-
-	if [ -d /etc/letsencrypt/live/domain ]; then
-		le_dir="/etc/letsencrypt/live/domain"
-	elif [ -d "/etc/letsencrypt/live/${fqdn}" ]; then
-		le_dir="/etc/letsencrypt/live/${fqdn}"
-	fi
-
-	mkdir -p "$hook_dir"
-	__backup_file "$hook_file"
-	cat >"$hook_file" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-	lineage="${RENEWED_LINEAGE:-}"
-	if [ -z "$lineage" ]; then
-		for candidate in "/etc/letsencrypt/live/domain" "/etc/letsencrypt/live/$(hostname -f 2>/dev/null || hostname)"; do
-			[ -d "$candidate" ] || continue
-			lineage="$candidate"
-			break
-		done
-	fi
-
-	[ -n "$lineage" ] || exit 0
-	[ -f "${lineage}/fullchain.pem" ] || exit 0
-	[ -f "${lineage}/privkey.pem" ] || exit 0
-
-	cert_tmp="$(mktemp)"
-	key_tmp="$(mktemp)"
-	trap 'rm -f "$cert_tmp" "$key_tmp"' EXIT
-
-	cp "${lineage}/fullchain.pem" "$cert_tmp"
-	cp "${lineage}/privkey.pem" "$key_tmp"
-	cp "$cert_tmp" /etc/pve/local/pve-ssl.pem
-	cp "$key_tmp" /etc/pve/local/pve-ssl.key
-
-	systemctl reload-or-restart pveproxy >/dev/null 2>&1 || systemctl restart pveproxy >/dev/null 2>&1 || true
-	if systemctl is-active --quiet nginx; then
-		systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
-	fi
-EOF
-	chmod 750 "$hook_file"
-
-	if [ -n "$le_dir" ] && [ -f "${le_dir}/fullchain.pem" ] && [ -f "${le_dir}/privkey.pem" ]; then
-		"$hook_file" || __log_fatal "Failed to copy Let's Encrypt certificates from ${le_dir}"
-		__add_summary "Synced Let's Encrypt certificates from ${le_dir} into Proxmox"
-	fi
-}
-
-__run_apt_noninteractive() {
-	local attempt rc log_file policy_rc backup_policy_rc restore_backup=0
-	log_file="$(mktemp)"
-	policy_rc="/usr/sbin/policy-rc.d"
-	backup_policy_rc="$(mktemp)"
-
-	if [ -e "$policy_rc" ]; then
-		cp -a "$policy_rc" "$backup_policy_rc"
-		restore_backup=1
-	fi
-
-	cat >"$policy_rc" <<-'EOF'
-		#!/bin/sh
-		exit 101
+__configure_firmware_warning_suppression() {
+	__backup_file "/etc/apt/apt.conf.d/99-proxmox-bootstrap-firmware-warning"
+	cat >/etc/apt/apt.conf.d/99-proxmox-bootstrap-firmware-warning <<-EOF
+		APT::Get::Update::SourceListWarnings::NonFreeFirmware "false";
 	EOF
-	chmod 755 "$policy_rc"
+}
 
-	for attempt in 1 2 3; do
-		if TMPDIR=/var/tmp DEBIAN_FRONTEND=noninteractive "$@" >"$log_file" 2>&1; then
-			if [ "$restore_backup" -eq 1 ]; then
-				mv "$backup_policy_rc" "$policy_rc"
-			else
-				rm -f "$policy_rc" "$backup_policy_rc"
-			fi
-			rm -f "$log_file"
-			return 0
-		fi
+__configure_repositories_deb822() {
+	__backup_file "/etc/apt/sources.list"
+	: >/etc/apt/sources.list
 
-		rc=$?
-		if grep -qE -- "cannot stat pathname '.*/apt-dpkg-install-" "$log_file"; then
-			__log_warn "apt/dpkg temporary file race detected; retrying (${attempt}/3)"
-			TMPDIR=/var/tmp DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
-			TMPDIR=/var/tmp DEBIAN_FRONTEND=noninteractive apt-get -f install -y \
-				-o Dpkg::Options::="--force-confdef" \
-				-o Dpkg::Options::="--force-confold" >/dev/null 2>&1 || true
-			apt-get clean >/dev/null 2>&1 || true
-			continue
-		fi
+	__backup_file "/etc/apt/sources.list.d/debian.sources"
+	cat >/etc/apt/sources.list.d/debian.sources <<-EOF
+		Types: deb
+		URIs: http://deb.debian.org/debian/
+		Suites: ${PROXMOX_DEBIAN_CODENAME} ${PROXMOX_DEBIAN_CODENAME}-updates
+		Components: main contrib non-free non-free-firmware
+		Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 
-		break
+		Types: deb
+		URIs: http://security.debian.org/debian-security/
+		Suites: ${PROXMOX_DEBIAN_CODENAME}-security
+		Components: main contrib non-free non-free-firmware
+		Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+	EOF
+
+	__backup_file "/etc/apt/sources.list.d/pve-enterprise.sources"
+	cat >/etc/apt/sources.list.d/pve-enterprise.sources <<-EOF
+		# Types: deb
+		# URIs: https://enterprise.proxmox.com/debian/pve
+		# Suites: ${PROXMOX_DEBIAN_CODENAME}
+		# Components: pve-enterprise
+		# Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+	EOF
+
+	if [ -f "/etc/apt/sources.list.d/pve-install-repo.sources" ]; then
+		__backup_file "/etc/apt/sources.list.d/pve-install-repo.sources"
+		: >/etc/apt/sources.list.d/pve-install-repo.sources
+	fi
+
+	cat >/etc/apt/sources.list.d/pve-no-subscription.sources <<-EOF
+		Types: deb
+		URIs: http://download.proxmox.com/debian/pve
+		Suites: ${PROXMOX_DEBIAN_CODENAME}
+		Components: pve-no-subscription
+		Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+	EOF
+
+	if [ -f "/etc/apt/sources.list.d/ceph.sources" ]; then
+		__backup_file "/etc/apt/sources.list.d/ceph.sources"
+		: >/etc/apt/sources.list.d/ceph.sources
+	fi
+}
+
+__configure_repositories_legacy() {
+	__backup_file "/etc/apt/sources.list"
+	cat >/etc/apt/sources.list <<-EOF
+		deb http://deb.debian.org/debian ${PROXMOX_DEBIAN_CODENAME} main contrib non-free non-free-firmware
+		deb http://deb.debian.org/debian ${PROXMOX_DEBIAN_CODENAME}-updates main contrib non-free non-free-firmware
+		deb http://security.debian.org/debian-security ${PROXMOX_DEBIAN_CODENAME}-security main contrib non-free non-free-firmware
+	EOF
+
+	__backup_file "/etc/apt/sources.list.d/pve-enterprise.list"
+	echo "# deb https://enterprise.proxmox.com/debian/pve ${PROXMOX_DEBIAN_CODENAME} pve-enterprise" >/etc/apt/sources.list.d/pve-enterprise.list
+
+	if [ -f "/etc/apt/sources.list.d/pve-install-repo.list" ]; then
+		__backup_file "/etc/apt/sources.list.d/pve-install-repo.list"
+		: >/etc/apt/sources.list.d/pve-install-repo.list
+	fi
+
+	cat >/etc/apt/sources.list.d/pve-no-subscription.list <<-EOF
+		deb http://download.proxmox.com/debian/pve ${PROXMOX_DEBIAN_CODENAME} pve-no-subscription
+	EOF
+
+	if [ -f "/etc/apt/sources.list.d/ceph.list" ]; then
+		__backup_file "/etc/apt/sources.list.d/ceph.list"
+		: >/etc/apt/sources.list.d/ceph.list
+	fi
+}
+
+__get_debian_codename() {
+	if [ -f /etc/os-release ]; then
+		# shellcheck disable=SC1091
+		. /etc/os-release
+		echo "${VERSION_CODENAME:-}"
+	fi
+}
+
+################################################################################
+# PACKAGE INSTALLATION
+################################################################################
+
+__install_package() {
+	local pkg="$1"
+
+	if dpkg -s "$pkg" >/dev/null 2>&1; then
+		return 0
+	fi
+
+	__log_info "Installing $pkg..."
+	__run_apt_noninteractive apt-get install -y --no-install-recommends \
+		-o Dpkg::Options::="--force-confdef" \
+		-o Dpkg::Options::="--force-confold" \
+		"$pkg" || {
+		__log_error "Failed to install: $pkg"
+		return 1
+	}
+	__log_success "Installed $pkg"
+}
+
+__install_packages() {
+	__log_info "Installing packages..."
+
+	local base_packages="vim sudo curl wget ca-certificates net-tools iproute2 iputils-ping screen jq bash-completion gawk rsync openssl"
+	local network_packages="nftables bridge-utils ifupdown2"
+	local service_packages="fail2ban apparmor apparmor-utils"
+	local optional_packages=""
+
+	if [ "$DNS_SERVER_TYPE" = "local" ]; then
+		service_packages="${service_packages} bind9 bind9-utils dnsutils"
+	else
+		base_packages="${base_packages} dnsutils"
+	fi
+
+	if [ "$DHCP_SERVER_TYPE" = "local" ]; then
+		service_packages="${service_packages} isc-dhcp-server"
+	elif [ "$DHCP_SERVER_TYPE" = "relay" ]; then
+		service_packages="${service_packages} isc-dhcp-relay"
+	fi
+
+	if [ "$RA_SERVER_TYPE" = "local" ]; then
+		service_packages="${service_packages} radvd"
+	fi
+
+	if __is_enabled "$CONFIGURE_POSTFIX" && [ "$POSTFIX_SERVER_TYPE" != "forward" ]; then
+		optional_packages="${optional_packages} postfix mailutils"
+	fi
+
+	if __is_enabled "$CONFIGURE_SDN"; then
+		optional_packages="${optional_packages} libpve-network-perl"
+	fi
+	optional_packages="${optional_packages} nginx"
+
+	for pkg in $base_packages $network_packages $service_packages $optional_packages; do
+		__install_package "$pkg" || true
 	done
 
-	cat "$log_file" >>"$PROXMOX_LOG_FILE"
-	if [ "$restore_backup" -eq 1 ]; then
-		mv "$backup_policy_rc" "$policy_rc"
-	else
-		rm -f "$policy_rc" "$backup_policy_rc"
-	fi
-	rm -f "$log_file"
-	return "${rc:-1}"
+	__log_success "Package installation complete"
 }
 
-__unmask_service_if_needed() {
-	local service="$1"
-	if [ "$(systemctl is-enabled "$service" 2>/dev/null || true)" = "masked" ]; then
-		systemctl unmask "$service" >/dev/null 2>&1 || __log_warn "Could not unmask ${service}"
-	fi
+__upgrade_system() {
+	__log_info "Applying non-interactive package upgrade..."
+
+	__run_apt_noninteractive apt-get dist-upgrade -y \
+		-o Dpkg::Options::="--force-confdef" \
+		-o Dpkg::Options::="--force-confold" || {
+		__log_error "Failed to complete package upgrade"
+		return 1
+	}
+
+	__log_success "System packages upgraded"
+	__add_summary "Applied non-interactive package upgrade"
 }
 
-__enable_restart_service() {
-	local service="$1" level="${2:-fatal}" message="${3:-Failed to restart ${1}}"
-	__unmask_service_if_needed "$service"
-	systemctl enable "$service" >/dev/null 2>&1 || true
-	if ! systemctl restart "$service"; then
-		if [ "$level" = "warn" ]; then
-			__log_warn "$message"
+__configure_kernel_policy() {
+	if ! __is_enabled "$PIN_NEWEST_PVE_KERNEL" && [ "${PVE_KERNEL_KEEP_COUNT:-0}" -lt 1 ]; then
+		return 0
+	fi
+
+	local packages versions newest current backup pkg version
+	packages="$(__list_installed_pve_kernel_packages)"
+	if [ -z "$packages" ]; then
+		__log_info "No installed Proxmox kernel image packages detected"
+		return 0
+	fi
+
+	versions="$(
+		printf '%s\n' "$packages" |
+			while IFS= read -r pkg; do
+				__kernel_version_from_package "$pkg"
+			done | awk 'NF' | sort -Vu
+	)"
+	newest="$(printf '%s\n' "$versions" | tail -1)"
+	current="$(uname -r)"
+	backup=""
+
+	if [ "${PVE_KERNEL_KEEP_COUNT:-2}" -gt 1 ]; then
+		if printf '%s\n' "$versions" | grep -Fxq -- "$current" && [ "$current" != "$newest" ]; then
+			backup="$current"
 		else
-			__log_fatal "$message"
+			backup="$(printf '%s\n' "$versions" | grep -Fvx -- "$newest" | tail -1 || true)"
 		fi
 	fi
+
+	__log_info "Applying Proxmox kernel policy..."
+	if __is_enabled "$PIN_NEWEST_PVE_KERNEL" && __command_exists proxmox-boot-tool; then
+		proxmox-boot-tool kernel pin "$newest" >/dev/null 2>&1 || {
+			__log_error "Failed to pin newest installed kernel: $newest"
+			return 1
+		}
+		__add_summary "Pinned newest installed kernel: ${newest}"
+	fi
+
+	local -a remove_pkgs=()
+	while IFS= read -r pkg; do
+		version="$(__kernel_version_from_package "$pkg")"
+		if [ "$version" = "$newest" ] || { [ -n "$backup" ] && [ "$version" = "$backup" ]; }; then
+			continue
+		fi
+		remove_pkgs+=("$pkg")
+	done <<-EOF
+	$packages
+	EOF
+
+	if [ "${#remove_pkgs[@]}" -gt 0 ]; then
+		DEBIAN_FRONTEND=noninteractive apt-get purge -y "${remove_pkgs[@]}" >/dev/null 2>&1 || {
+			__log_error "Failed to remove old Proxmox kernel packages"
+			return 1
+		}
+		__add_summary "Removed old Proxmox kernel packages: ${remove_pkgs[*]}"
+	fi
+
+	if __command_exists proxmox-boot-tool; then
+		proxmox-boot-tool refresh >/dev/null 2>&1 || {
+			__log_error "Failed to refresh proxmox-boot-tool after kernel changes"
+			return 1
+		}
+	fi
+
+	__configure_nested_virtualization
+
+	if [ -n "$backup" ]; then
+		__add_summary "Retained Proxmox kernels: ${newest}, ${backup}"
+	else
+		__add_summary "Retained Proxmox kernel: ${newest}"
+	fi
+
+	__log_success "Proxmox kernel policy applied"
+}
+
+__kernel_version_from_package() {
+	local pkg="$1"
+	pkg="${pkg#proxmox-kernel-}"
+	pkg="${pkg#pve-kernel-}"
+	pkg="${pkg%-signed}"
+	echo "$pkg"
+}
+
+__list_installed_pve_kernel_packages() {
+	dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E -- '^(proxmox|pve)-kernel-[0-9].*-pve(-signed)?$' || true
+}
+
+################################################################################
+# NETWORK CONFIGURATION
+################################################################################
+
+__is_network_configured() {
+	__lan_bridge_uses_target_port || return 1
+	__router_bridge_uses_target_port || return 1
+	__router_bridge_vlan_aware_configured || return 1
+
+	if $PROXMOX_SINGLE_NIC_MODE; then
+		ip link show "$LAN_NIC" >/dev/null 2>&1 && ip link show "$LAN_BR" >/dev/null 2>&1
+	else
+		ip link show "$WAN_BR" >/dev/null 2>&1 && ip link show "$LAN_BR" >/dev/null 2>&1 && { [ -z "$ROUTER_BR" ] || ip link show "$ROUTER_BR" >/dev/null 2>&1; }
+	fi
+}
+
+__configure_network() {
+	if __is_network_configured; then
+		__log_info "Network already configured, skipping"
+		return 0
+	fi
+
+	__log_info "Configuring network interfaces..."
+
+	__configure_network_additive
+
+	__log_info "Reloading network configuration (may cause brief disconnection)..."
+	__reload_network_config || __log_warn "network reload reported errors"
+
+	if ! __is_network_configured && __command_exists ifup; then
+		if __is_dummy_lan_iface "$LAN_NIC"; then
+			ifup "$LAN_NIC" 2>/dev/null || true
+		fi
+		if __is_router_dummy_iface "$ROUTER_NIC"; then
+			ifup "$ROUTER_NIC" 2>/dev/null || true
+		fi
+		ifup "$LAN_BR" 2>/dev/null || true
+		[ -n "$ROUTER_BR" ] && ifup "$ROUTER_BR" 2>/dev/null || true
+	fi
+
+	if __is_network_configured; then
+		__log_success "Network configured successfully"
+	else
+		__log_error "Network configuration may have failed"
+		return 1
+	fi
+}
+
+__configure_network_additive() {
+	__backup_file "/etc/network/interfaces"
+
+	if __is_dummy_lan_iface "$LAN_NIC"; then
+		modprobe dummy 2>/dev/null || true
+		if ! grep -q -- "^dummy$" /etc/modules 2>/dev/null; then
+			echo "dummy" >>/etc/modules
+		fi
+
+		if ! ip link show "$LAN_NIC" >/dev/null 2>&1; then
+			ip link add "$LAN_NIC" type dummy || true
+		fi
+	fi
+
+	if __is_router_dummy_iface "$ROUTER_NIC"; then
+		modprobe dummy 2>/dev/null || true
+		if ! grep -q -- "^dummy$" /etc/modules 2>/dev/null; then
+			echo "dummy" >>/etc/modules
+		fi
+
+		if ! ip link show "$ROUTER_NIC" >/dev/null 2>&1; then
+			ip link add "$ROUTER_NIC" type dummy || true
+		fi
+	fi
+
+	if ! grep -q -- "^auto ${WAN_BR}$" /etc/network/interfaces 2>/dev/null && [ -n "$WAN_NIC" ] && { [ -n "$WAN_V4" ] || [ -n "$WAN_V6" ]; }; then
+		__append_wan_bridge
+	fi
+
+	if ! grep -q -- "^auto ${LAN_NIC}$" /etc/network/interfaces 2>/dev/null; then
+		__append_manual_iface "$LAN_NIC"
+	fi
+
+	if ! grep -q -- "^auto ${LAN_BR}$" /etc/network/interfaces 2>/dev/null; then
+		__append_lan_bridge
+	fi
+
+	__ensure_lan_bridge_settings
+
+	if [ -n "$ROUTER_NIC" ] && ! grep -q -- "^auto ${ROUTER_NIC}$" /etc/network/interfaces 2>/dev/null; then
+		__append_manual_iface "$ROUTER_NIC"
+	fi
+
+	if [ -n "$ROUTER_BR" ] && ! grep -q -- "^auto ${ROUTER_BR}$" /etc/network/interfaces 2>/dev/null; then
+		__append_router_bridge
+	fi
+
+	__ensure_router_bridge_settings
+
+	if ! grep -q -- "^source /etc/network/interfaces.d/\*" /etc/network/interfaces 2>/dev/null; then
+		printf '\nsource /etc/network/interfaces.d/*\n' >>/etc/network/interfaces
+	fi
+}
+
+__append_manual_iface() {
+	local iface="$1"
+	if __is_dummy_lan_iface "$iface"; then
+		cat >>/etc/network/interfaces <<-EOF
+
+			auto ${iface}
+			iface ${iface} inet manual
+			    pre-up ip link add ${iface} type dummy 2>/dev/null || true
+		EOF
+	else
+		cat >>/etc/network/interfaces <<-EOF
+
+			auto ${iface}
+			iface ${iface} inet manual
+		EOF
+	fi
+}
+
+__append_wan_bridge() {
+	cat >>/etc/network/interfaces <<-EOF
+
+		auto ${WAN_BR}
+		iface ${WAN_BR} inet static
+		    address ${WAN_V4}
+		    broadcast ${WAN_V4_BRD}
+		    gateway ${WAN_V4_GW}
+		    bridge-ports ${WAN_NIC}
+		    bridge-stp off
+		    bridge-fd 0
+		    # Proxmox bootstrap WAN bridge for host uplink
+	EOF
+	if [ -n "$WAN_V6" ]; then
+		cat >>/etc/network/interfaces <<-EOF
+
+			iface ${WAN_BR} inet6 static
+			    address ${WAN_V6}
+			    gateway ${WAN_V6_GW}
+		EOF
+	fi
+}
+
+__append_lan_bridge() {
+	cat >>/etc/network/interfaces <<-EOF
+
+		auto ${LAN_BR}
+		iface ${LAN_BR} inet static
+		    address ${LAN_V4}
+		    broadcast ${LAN_V4_BRD}
+		    bridge-ports ${LAN_NIC}
+		    bridge-stp off
+		    bridge-fd 0
+		    # Proxmox bootstrap LAN bridge for guests
+
+		iface ${LAN_BR} inet6 static
+		    address ${LAN_V6_ROUTER_IP}/64
+	EOF
+}
+
+__append_router_bridge() {
+	cat >>/etc/network/interfaces <<-EOF
+
+		auto ${ROUTER_BR}
+		iface ${ROUTER_BR} inet manual
+		    bridge-ports ${ROUTER_NIC}
+		    bridge-stp off
+		    bridge-fd 0
+		    bridge-vlan-aware yes
+		    # Proxmox bootstrap router-lab bridge for pfSense and downstream guests
+	EOF
 }
 
 __reload_network_config() {
@@ -984,201 +1680,6 @@ __reload_network_config() {
 	fi
 
 	systemctl restart networking >/dev/null 2>&1
-}
-
-__configure_apparmor() {
-	__log_info "Configuring AppArmor..."
-
-	if ! __command_exists aa-status; then
-		__log_info "AppArmor tools not installed yet, skipping profile reload"
-		return 0
-	fi
-
-	__unmask_service_if_needed apparmor
-	systemctl enable apparmor >/dev/null 2>&1 || true
-	systemctl start apparmor >/dev/null 2>&1 || true
-
-	for profile in /etc/apparmor.d/usr.sbin.named /etc/apparmor.d/usr.sbin.dhcpd /etc/apparmor.d/usr.sbin.radvd /etc/apparmor.d/usr.sbin.postfix; do
-		[ -f "$profile" ] || continue
-		apparmor_parser -r "$profile" >/dev/null 2>&1 || __log_warn "Could not reload AppArmor profile: $profile"
-	done
-
-	__log_success "AppArmor configured"
-}
-
-__detect_pve_version() {
-	if ! __command_exists pveversion; then
-		__log_fatal "Proxmox VE not detected. This script requires Proxmox VE 7+"
-	fi
-
-	local pve_version
-	pve_version=$(pveversion | awk -F/ 'NR==1{split($2,a,"."); print a[1]; exit}')
-	PROXMOX_PVE_MAJOR_VERSION="$pve_version"
-
-	if [ "$PROXMOX_PVE_MAJOR_VERSION" -lt 7 ]; then
-		__log_fatal "Unsupported Proxmox VE version: $PROXMOX_PVE_MAJOR_VERSION (requires 7+)"
-	fi
-
-	__log_info "Detected Proxmox VE version: $PROXMOX_PVE_MAJOR_VERSION"
-}
-
-__get_pve_node_name() {
-	if [ -d /etc/pve/nodes ]; then
-		find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n1
-	else
-		hostname -s 2>/dev/null || hostname
-	fi
-}
-
-__configure_node_name() {
-	[ -n "$PVE_NODE_NAME" ] || return 0
-
-	local current_node
-	current_node="$(__get_pve_node_name)"
-	if [ -z "$current_node" ] || [ "$current_node" = "$PVE_NODE_NAME" ]; then
-		return 0
-	fi
-
-	if __command_exists pvecm && pvecm status >/dev/null 2>&1 && ! __is_enabled "$FORCE_NODE_RENAME"; then
-		__log_fatal "Refusing to rename clustered Proxmox node without FORCE_NODE_RENAME=yes"
-	fi
-
-	__log_warn "Renaming Proxmox node from ${current_node} to ${PVE_NODE_NAME}"
-	__backup_file /etc/hostname
-	__backup_file /etc/hosts
-	__backup_file /etc/mailname
-
-	echo "$PVE_NODE_NAME" >/etc/hostname
-	hostname "$PVE_NODE_NAME" 2>/dev/null || true
-
-	if [ -f /etc/hosts ]; then
-		sed -i "s/\b${current_node}\b/${PVE_NODE_NAME}/g" /etc/hosts
-	fi
-	if [ -f /etc/mailname ]; then
-		sed -i "s/\b${current_node}\b/${PVE_NODE_NAME}/g" /etc/mailname
-	fi
-
-	POSTFIX_MYHOSTNAME="${PVE_NODE_NAME}.${LAN_DOMAIN}"
-	__log_success "Node rename applied; reboot may be required for all Proxmox services"
-}
-
-__get_primary_ip() {
-	local addr
-	addr="$(ip -4 -o route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
-	if [ -z "$addr" ]; then
-		addr="$(hostname -I 2>/dev/null | awk '{ print $1 }')"
-	fi
-	echo "$addr"
-}
-
-__get_target_node_name() {
-	echo "${PVE_NODE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
-}
-
-__ensure_node_hosts_entry() {
-	local short fqdn addr hosts_tmp has_entry
-	short="$(__get_target_node_name)"
-	fqdn="${short}.${LAN_DOMAIN}"
-
-	has_entry='$1 !~ /^#/ && $1 !~ /^127\./ && $1 != "::1" {'
-	has_entry="${has_entry} for (i = 2; i <= NF; i++) if (\$i == name) found = 1"
-	has_entry="${has_entry} } END { exit !found }"
-	if awk -v name="$short" "$has_entry" /etc/hosts; then
-		return 0
-	fi
-
-	addr="$(__get_primary_ip)"
-	[ -n "$addr" ] || __log_fatal "Could not determine a non-loopback IP address for node ${short}"
-
-	__log_info "Adding ${short} (${addr}) to /etc/hosts so pmxcfs can resolve the node name..."
-	__backup_file /etc/hosts
-	hosts_tmp="$(mktemp)"
-	awk -v fqdn="$fqdn" -v short="$short" '
-		/^[[:space:]]*#/ || NF == 0 { print; next }
-		$1 ~ /^127\./ || $1 == "::1" {
-			line = $1
-			names = 0
-			for (i = 2; i <= NF; i++) if ($i != fqdn && $i != short) { line = line " " $i; names++ }
-			if (names > 0) print line
-			next
-		}
-		{ print }
-	' /etc/hosts >"$hosts_tmp"
-	printf '%s %s %s\n' "$addr" "$fqdn" "$short" >>"$hosts_tmp"
-	cat "$hosts_tmp" >/etc/hosts
-	rm -f "$hosts_tmp"
-	__add_summary "Added ${short} (${addr}) to /etc/hosts"
-}
-
-__ensure_pve_cluster() {
-	if systemctl is-active --quiet pve-cluster && [ -d /etc/pve/nodes ]; then
-		return 0
-	fi
-
-	__log_info "Starting pve-cluster so /etc/pve is available..."
-	systemctl reset-failed pve-cluster >/dev/null 2>&1 || true
-	systemctl start pve-cluster || __log_fatal "pve-cluster could not be started; see journalctl -u pve-cluster (the node name must resolve to a non-loopback IP in /etc/hosts)"
-	for _ in 1 2 3 4 5 6 7 8 9 10; do
-		[ -d /etc/pve/nodes ] && break
-		sleep 1
-	done
-	[ -d /etc/pve/nodes ] || __log_fatal "pve-cluster started but /etc/pve/nodes is still missing"
-}
-
-__ensure_pve_node_dir() {
-	local target current count
-	target="$(__get_target_node_name)"
-
-	if [ -d "/etc/pve/nodes/${target}" ]; then
-		return 0
-	fi
-
-	count="$(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
-	current="$(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n1)"
-
-	if [ "$count" -eq 1 ] && { [ ! -f /etc/pve/corosync.conf ] || __is_enabled "$FORCE_NODE_RENAME"; }; then
-		mv "/etc/pve/nodes/${current}" "/etc/pve/nodes/${target}" || __log_fatal "Could not move /etc/pve/nodes/${current} to ${target}"
-		__log_success "Moved Proxmox node directory ${current} to ${target}"
-		__add_summary "Renamed Proxmox node directory ${current} to ${target}"
-	else
-		__log_fatal "Proxmox node directory /etc/pve/nodes/${target} is missing and cannot be moved safely (found ${count} node directories; clustered hosts need FORCE_NODE_RENAME=yes)"
-	fi
-}
-
-__ensure_pve_cert() {
-	local pve_cert pve_key
-	pve_cert="/etc/pve/local/pve-ssl.pem"
-	pve_key="/etc/pve/local/pve-ssl.key"
-
-	if [ -f "$pve_cert" ] && [ -f "$pve_key" ]; then
-		return 0
-	fi
-
-	__command_exists pvecm || __log_fatal "Missing Proxmox SSL certificate and pvecm is not available to create it"
-	__log_info "Proxmox SSL certificate missing; generating with pvecm updatecerts..."
-	pvecm updatecerts --force || __log_fatal "Failed to generate Proxmox SSL certificate"
-	systemctl restart pveproxy >/dev/null 2>&1 || true
-
-	[ -f "$pve_cert" ] || __log_fatal "Missing Proxmox SSL certificate after pvecm updatecerts: $pve_cert"
-	[ -f "$pve_key" ] || __log_fatal "Missing Proxmox SSL key after pvecm updatecerts: $pve_key"
-	__add_summary "Generated Proxmox SSL certificate with pvecm updatecerts"
-}
-
-__proxmox_init() {
-	__log_info "Initializing Proxmox node..."
-	__ensure_node_hosts_entry
-	__ensure_pve_cluster
-	__ensure_pve_node_dir
-	__ensure_pve_cert
-	__log_success "Proxmox node initialized"
-}
-
-__get_debian_codename() {
-	if [ -f /etc/os-release ]; then
-		# shellcheck disable=SC1091
-		. /etc/os-release
-		echo "${VERSION_CODENAME:-}"
-	fi
 }
 
 __detect_network_interfaces() {
@@ -1596,806 +2097,189 @@ ${wan_ip_current}/24"
 }
 
 ################################################################################
-# CONFIGURATION FILE MANAGEMENT
+# PROXMOX NODE INITIALIZATION
 ################################################################################
 
-__create_config_file() {
-	__log_info "Creating configuration file: $PROXMOX_CONFIG_FILE"
-
-	local config_mail_relay_host config_postfix_smtp_relay
-	config_mail_relay_host="${MAIL_RELAY_HOST}"
-	config_postfix_smtp_relay="${POSTFIX_SMTP_RELAY}"
-	if [ "$config_mail_relay_host" = "mail.example.com" ]; then config_mail_relay_host=""; fi
-	if [ "$config_postfix_smtp_relay" = "mail.example.com" ]; then config_postfix_smtp_relay=""; fi
-
-	cat >"$PROXMOX_CONFIG_FILE" <<-EOF
-		# Proxmox Bootstrap Configuration
-		# Generated: $(date)
-		# Version: $PROXMOX_SCRIPT_VERSION
-
-		# Network Configuration
-		WAN_NIC="${WAN_NIC}"
-		LAN_NIC="${LAN_NIC}"
-		ROUTER_NIC="${ROUTER_NIC}"
-		WAN_BR="${WAN_BR}"
-		LAN_BR="${LAN_BR}"
-		ROUTER_BR="${ROUTER_BR}"
-
-		# WAN IPv4
-		WAN_V4="${WAN_V4}"
-		WAN_V4_GW="${WAN_V4_GW}"
-		WAN_V4_BRD="${WAN_V4_BRD}"
-
-		# WAN IPv6
-		WAN_V6="${WAN_V6}"
-		WAN_V6_GW="${WAN_V6_GW}"
-
-		# LAN IPv4
-		LAN_V4="${LAN_V4}"
-		LAN_V4_BRD="${LAN_V4_BRD}"
-		LAN_V4_NET="${LAN_V4_NET}"
-		DHCP_V4_START="${DHCP_V4_START}"
-		DHCP_V4_END="${DHCP_V4_END}"
-		LAN_DOMAIN="${LAN_DOMAIN}"
-
-		# LAN IPv6
-		LAN_V6_PREFIX="${LAN_V6_PREFIX}"
-		LAN_V6_ROUTER_IP="${LAN_V6_ROUTER_IP}"
-		LAN_V6_STATEFUL="${LAN_V6_STATEFUL}"
-		LAN_V6_RANGE_LOW="${LAN_V6_RANGE_LOW}"
-		LAN_V6_RANGE_HIGH="${LAN_V6_RANGE_HIGH}"
-		LAN_IPV6_IS_ULA="${LAN_IPV6_IS_ULA}"
-		NAT66_ENABLE="${NAT66_ENABLE}"
-
-		# DNS Forwarders
-		FWD1="${FWD1}"
-		FWD2="${FWD2}"
-		FWD3="${FWD3}"
-
-		# Mail Configuration
-		MAIL_RELAY_HOST="${config_mail_relay_host}"
-		MAIL_RELAY_PORT="${MAIL_RELAY_PORT}"
-		ROOT_MAIL_FORWARD="${ROOT_MAIL_FORWARD}"
-		CONFIGURE_POSTFIX="${CONFIGURE_POSTFIX}"
-		POSTFIX_SERVER_TYPE="${POSTFIX_SERVER_TYPE}"
-		POSTFIX_SMTP_RELAY="${config_postfix_smtp_relay}"
-		POSTFIX_SMTP_PORT="${POSTFIX_SMTP_PORT}"
-		POSTFIX_FROM_EMAIL="${POSTFIX_FROM_EMAIL}"
-		POSTFIX_FROM_NAME="${POSTFIX_FROM_NAME}"
-		POSTFIX_ROOT_FORWARD="${POSTFIX_ROOT_FORWARD}"
-		POSTFIX_MYHOSTNAME="${POSTFIX_MYHOSTNAME}"
-		POSTFIX_MYDOMAIN="${POSTFIX_MYDOMAIN}"
-		POSTFIX_RELAY_TLS="${POSTFIX_RELAY_TLS}"
-		POSTFIX_RELAY_USERNAME="${POSTFIX_RELAY_USERNAME}"
-		POSTFIX_RELAY_PASSWORD="${POSTFIX_RELAY_PASSWORD}"
-		POSTFIX_WAN_ENABLE="${POSTFIX_WAN_ENABLE}"
-		POSTFIX_FORWARD_HOST="${POSTFIX_FORWARD_HOST}"
-		POSTFIX_FORWARD_PORTS="${POSTFIX_FORWARD_PORTS}"
-
-		# DNS/DHCP/RA Service Modes
-		DNS_SERVER_TYPE="${DNS_SERVER_TYPE}"
-		DNS_FORWARD_HOST="${DNS_FORWARD_HOST}"
-		DNS_FORWARD_PORTS="${DNS_FORWARD_PORTS}"
-		DNS_SPLIT_ENABLE="${DNS_SPLIT_ENABLE}"
-		DNS_WAN_ENABLE="${DNS_WAN_ENABLE}"
-		DNS_WAN_ZONE="${DNS_WAN_ZONE}"
-		DNS_WAN_RECORDS_FILE="${DNS_WAN_RECORDS_FILE}"
-		DNS_LAN_RECURSION="${DNS_LAN_RECURSION}"
-		DNS_WAN_RECURSION="${DNS_WAN_RECURSION}"
-		DHCP_SERVER_TYPE="${DHCP_SERVER_TYPE}"
-		DHCP_RELAY_HOST="${DHCP_RELAY_HOST}"
-		DHCP_RELAY_INTERFACES="${DHCP_RELAY_INTERFACES}"
-		RA_SERVER_TYPE="${RA_SERVER_TYPE}"
-
-		# Node/Guest Defaults
-		PVE_NODE_NAME="${PVE_NODE_NAME}"
-		FORCE_NODE_RENAME="${FORCE_NODE_RENAME}"
-		GUEST_DEFAULT_BRIDGE="${GUEST_DEFAULT_BRIDGE}"
-
-		# Feature Flags
-		DOWNLOAD_ISOS="${DOWNLOAD_ISOS}"
-		DOWNLOAD_TEMPLATES="${DOWNLOAD_TEMPLATES}"
-		RUN_PROXMENUX="${RUN_PROXMENUX}"
-		CONFIGURE_SDN="${CONFIGURE_SDN}"
-		DISABLE_SUBSCRIPTION_NAG="${DISABLE_SUBSCRIPTION_NAG}"
-		AUTO_DIST_UPGRADE="${AUTO_DIST_UPGRADE}"
-		PIN_NEWEST_PVE_KERNEL="${PIN_NEWEST_PVE_KERNEL}"
-		PVE_KERNEL_KEEP_COUNT="${PVE_KERNEL_KEEP_COUNT}"
-		ENABLE_NESTED_VIRT="${ENABLE_NESTED_VIRT}"
-	EOF
-
-	chown root:root "$PROXMOX_CONFIG_FILE"
-	chmod 600 "$PROXMOX_CONFIG_FILE"
-	__log_success "Configuration file created"
-}
-
-__load_config_file() {
-	if [ -f "$PROXMOX_CONFIG_FILE" ]; then
-		__log_info "Loading configuration from: $PROXMOX_CONFIG_FILE"
-		__load_assignment_file "$PROXMOX_CONFIG_FILE"
+__get_host_fqdn() {
+	local fqdn
+	fqdn="$(hostname -f 2>/dev/null || true)"
+	if [ -n "$fqdn" ] && printf '%s' "$fqdn" | grep -q -- '\.'; then
+		echo "$fqdn"
+		return 0
 	fi
-	if [ -f "$PROXMOX_ENV_FILE" ]; then
-		__log_info "Loading environment overrides from: $PROXMOX_ENV_FILE"
-		__load_assignment_file "$PROXMOX_ENV_FILE"
+	if [ -n "${PVE_NODE_NAME:-}" ] && [ -n "${LAN_DOMAIN:-}" ]; then
+		echo "${PVE_NODE_NAME}.${LAN_DOMAIN}"
+		return 0
 	fi
-	__load_resolved_network_state
-	__derive_config_values
+	echo "$(__get_pve_node_name).${LAN_DOMAIN}"
 }
 
-__state_task_done() {
-	local task="$1"
-	[ -f "$PROXMOX_STATE_FILE" ] || return 1
-	awk -F'|' -v task="$task" '$1 == task { found = 1; exit 0 } END { exit(found ? 0 : 1) }' "$PROXMOX_STATE_FILE"
+__detect_pve_version() {
+	if ! __command_exists pveversion; then
+		__log_fatal "Proxmox VE not detected. This script requires Proxmox VE 7+"
+	fi
+
+	local pve_version
+	pve_version=$(pveversion | awk -F/ 'NR==1{split($2,a,"."); print a[1]; exit}')
+	PROXMOX_PVE_MAJOR_VERSION="$pve_version"
+
+	if [ "$PROXMOX_PVE_MAJOR_VERSION" -lt 7 ]; then
+		__log_fatal "Unsupported Proxmox VE version: $PROXMOX_PVE_MAJOR_VERSION (requires 7+)"
+	fi
+
+	__log_info "Detected Proxmox VE version: $PROXMOX_PVE_MAJOR_VERSION"
 }
 
-__with_state_lock() {
-	local lock_file lock_dir
-	local rc
-	lock_file="${PROXMOX_STATE_FILE}.lock"
-	lock_dir="${lock_file}.d"
-
-	if __command_exists flock; then
-		(
-			flock -x 9
-			"$@"
-		) 9>"$lock_file"
+__get_pve_node_name() {
+	if [ -d /etc/pve/nodes ]; then
+		find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n1
 	else
-		while ! mkdir "$lock_dir" 2>/dev/null; do
-			sleep 0.1
-		done
-		"$@"
-		rc=$?
-		rmdir "$lock_dir"
-		return "$rc"
+		hostname -s 2>/dev/null || hostname
 	fi
 }
 
-__write_task_state() {
-	local task="$1"
-	local tmp_file
-	mkdir -p "${PROXMOX_STATE_FILE%/*}"
-	tmp_file="$(mktemp)"
-	if [ -f "$PROXMOX_STATE_FILE" ]; then
-		awk -F'|' -v task="$task" '$1 != task' "$PROXMOX_STATE_FILE" >"$tmp_file"
-	fi
-	printf '%s|%s\n' "$task" "$(date '+%Y-%m-%d %H:%M:%S')" >>"$tmp_file"
-	mv "$tmp_file" "$PROXMOX_STATE_FILE"
-}
+__configure_node_name() {
+	[ -n "$PVE_NODE_NAME" ] || return 0
 
-__remove_task_state() {
-	local task="$1"
-	local tmp_file
-	tmp_file="$(mktemp)"
-	awk -F'|' -v task="$task" '$1 != task' "$PROXMOX_STATE_FILE" >"$tmp_file"
-	mv "$tmp_file" "$PROXMOX_STATE_FILE"
-}
-
-__mark_task_done() {
-	local task="$1"
-	__with_state_lock __write_task_state "$task"
-}
-
-__run_task() {
-	local task="$1"
-	local fn="$2"
-
-	if ! $PROXMOX_FORCE_MODE && __state_task_done "$task"; then
-		__log_info "Skipping completed task: $task"
+	local current_node
+	current_node="$(__get_pve_node_name)"
+	if [ -z "$current_node" ] || [ "$current_node" = "$PVE_NODE_NAME" ]; then
 		return 0
 	fi
 
-	"$fn"
-	__mark_task_done "$task"
+	if __command_exists pvecm && pvecm status >/dev/null 2>&1 && ! __is_enabled "$FORCE_NODE_RENAME"; then
+		__log_fatal "Refusing to rename clustered Proxmox node without FORCE_NODE_RENAME=yes"
+	fi
+
+	__log_warn "Renaming Proxmox node from ${current_node} to ${PVE_NODE_NAME}"
+	__backup_file /etc/hostname
+	__backup_file /etc/hosts
+	__backup_file /etc/mailname
+
+	echo "$PVE_NODE_NAME" >/etc/hostname
+	hostname "$PVE_NODE_NAME" 2>/dev/null || true
+
+	if [ -f /etc/hosts ]; then
+		sed -i "s/\b${current_node}\b/${PVE_NODE_NAME}/g" /etc/hosts
+	fi
+	if [ -f /etc/mailname ]; then
+		sed -i "s/\b${current_node}\b/${PVE_NODE_NAME}/g" /etc/mailname
+	fi
+
+	POSTFIX_MYHOSTNAME="${PVE_NODE_NAME}.${LAN_DOMAIN}"
+	__log_success "Node rename applied; reboot may be required for all Proxmox services"
 }
 
-__show_status() {
-	if [ ! -f "$PROXMOX_STATE_FILE" ]; then
-		echo "No completed tasks recorded."
+__get_primary_ip() {
+	local addr
+	addr="$(ip -4 -o route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
+	if [ -z "$addr" ]; then
+		addr="$(hostname -I 2>/dev/null | awk '{ print $1 }')"
+	fi
+	echo "$addr"
+}
+
+__get_target_node_name() {
+	echo "${PVE_NODE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
+}
+
+__ensure_node_hosts_entry() {
+	local short fqdn addr hosts_tmp has_entry
+	short="$(__get_target_node_name)"
+	fqdn="${short}.${LAN_DOMAIN}"
+
+	has_entry='$1 !~ /^#/ && $1 !~ /^127\./ && $1 != "::1" {'
+	has_entry="${has_entry} for (i = 2; i <= NF; i++) if (\$i == name) found = 1"
+	has_entry="${has_entry} } END { exit !found }"
+	if awk -v name="$short" "$has_entry" /etc/hosts; then
 		return 0
 	fi
 
-	echo "Completed tasks:"
-	while IFS='|' read -r task completed_at; do
-		[ -n "$task" ] || continue
-		echo "  - $task (completed: $completed_at)"
-	done <"$PROXMOX_STATE_FILE"
-}
+	addr="$(__get_primary_ip)"
+	[ -n "$addr" ] || __log_fatal "Could not determine a non-loopback IP address for node ${short}"
 
-__clear_state() {
-	local task="${1:-}"
-
-	if [ -z "$task" ]; then
-		rm -f "$PROXMOX_STATE_FILE"
-		rm -f "${PROXMOX_STATE_FILE}.lock"
-		rmdir "${PROXMOX_STATE_FILE}.lock.d" 2>/dev/null || true
-		echo "Cleared all state."
-		return 0
-	fi
-
-	if [ ! -f "$PROXMOX_STATE_FILE" ]; then
-		echo "No state file exists."
-		return 0
-	fi
-
-	__with_state_lock __remove_task_state "$task"
-	echo "Cleared state for task: $task"
-}
-
-__reset_bootstrap() {
-	mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
-	__log_warn "Resetting Proxmox bootstrap-managed configuration"
-
-	local file
-	local -a packages
-	for file in \
-		/etc/nftables.conf \
-		/etc/bind/named.conf \
-		/etc/bind/zones.conf \
-		/etc/bind/dhcp.key \
-		/etc/bind/rndc.key \
-		/etc/dhcp/dhcpd.conf \
-		/etc/dhcp/dhcpd6.conf \
-		/etc/default/isc-dhcp-server \
-		/etc/default/isc-dhcp-relay \
-		/etc/radvd.conf \
-		/etc/sysctl.d/99-proxmox-bootstrap.conf \
-		/etc/apt/apt.conf.d/99-proxmox-bootstrap-firmware-warning \
-		/etc/apt/apt.conf.d/99-proxmox-bootstrap-disable-nag \
-		/usr/local/sbin/proxmox-bootstrap-disable-nag \
-		/etc/modprobe.d/proxmox-bootstrap-kvm.conf \
-		/etc/letsencrypt/renewal-hooks/deploy/proxmox-bootstrap-copy-pve-cert \
-		/etc/nginx/nginx.conf \
-		/etc/proxmox-bootstrap.conf; do
-		__backup_file "$file"
-		rm -f "$file"
-	done
-
-	if [ -d /etc/pve/sdn ]; then
-		__backup_file /etc/pve/sdn/sdn.cfg
-		__backup_file /etc/pve/sdn/ipam.cfg
-		rm -f /etc/pve/sdn/sdn.cfg /etc/pve/sdn/ipam.cfg
-	fi
-
-	if [ -d "$PROXMOX_OPTIONAL_TOOLS_DIR" ]; then
-		mkdir -p "${PROXMOX_BACKUP_DIR}${PROXMOX_OPTIONAL_TOOLS_DIR}"
-		cp -a "$PROXMOX_OPTIONAL_TOOLS_DIR"/. "${PROXMOX_BACKUP_DIR}${PROXMOX_OPTIONAL_TOOLS_DIR}/" 2>/dev/null || true
-		rm -rf "$PROXMOX_OPTIONAL_TOOLS_DIR"
-	fi
-
-	rm -f /etc/fail2ban/jail.d/proxmox-bootstrap.conf
-	rm -f /etc/modules-load.d/proxmox-bootstrap.conf
-	rm -rf /etc/systemd/system/named.service.d
-	if [ -d /etc/nginx ]; then
-		mkdir -p "${PROXMOX_BACKUP_DIR}/etc"
-		cp -a /etc/nginx "${PROXMOX_BACKUP_DIR}/etc/" 2>/dev/null || true
-		find /etc/nginx -mindepth 1 ! -name mime.types -exec rm -rf {} +
-	fi
-
-	systemctl disable --now bind9 isc-dhcp-server isc-dhcp-relay radvd postfix nftables fail2ban nginx >/dev/null 2>&1 || true
-
-	packages=(
-		bind9 bind9-utils dnsutils isc-dhcp-server isc-dhcp-relay radvd postfix
-		mailutils fail2ban apparmor-utils libpve-network-perl nginx
-	)
-	DEBIAN_FRONTEND=noninteractive apt-get purge -y "${packages[@]}" >/dev/null 2>&1 || __log_warn "Some bootstrap-managed packages could not be purged"
-	DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
-
-	rm -f "$PROXMOX_STATE_FILE"
-	rm -f "$PROXMOX_RESOLVED_NETWORK_STATE_FILE"
-	__log_success "Reset complete; backups preserved at $PROXMOX_BACKUP_DIR"
-}
-
-# Bootstrap/setup script — exempt from triple-sync (no man page or shell completions required)
-__usage() {
-	cat <<-EOF
-		Usage: $0 [options]
-
-		Options:
-		  --init                 Create $PROXMOX_CONFIG_FILE and exit
-		  --status               Show completed bootstrap tasks
-		  --clear-state [task]   Clear all state or one task
-		  --reset                Remove managed configuration and state
-		  --force                Re-run tasks even when state says complete
-		  --debug                Enable debug output
-		  --color auto|yes|no    Control color output (default: auto)
-		  --version              Print version and exit
-		  --help                 Show this help
-	EOF
-}
-
-__parse_args() {
-	while [ "$#" -gt 0 ]; do
-		case "$1" in
-		--init)
-			mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
-			__load_config_file
-			__detect_network_interfaces
-			__derive_config_values
-			__create_config_file
-			exit 0
-			;;
-		--status)
-			__show_status
-			exit 0
-			;;
-		--clear-state)
-			if [ "${2:-}" != "" ] && [ "${2#--}" = "$2" ]; then
-				PROXMOX_CLEAR_STATE_TASK="$2"
-				shift
-			fi
-			__clear_state "$PROXMOX_CLEAR_STATE_TASK"
-			exit 0
-			;;
-		--reset)
-			__reset_bootstrap
-			exit 0
-			;;
-		--force)
-			PROXMOX_FORCE_MODE=true
-			;;
-		--debug)
-			PROXMOX_DEBUG=true
-			;;
-		--color)
-			if [ "${2:-}" = "auto" ] || [ "${2:-}" = "yes" ] || [ "${2:-}" = "no" ]; then
-				PROXMOX_COLOR="$2"
-				shift
-			else
-				PROXMOX_COLOR="auto"
-			fi
-			;;
-		--version | -v)
-			printf '%s\n' "$VERSION"
-			exit 0
-			;;
-		--help | -h)
-			__usage
-			exit 0
-			;;
-		*)
-			__usage >&2
-			exit 2
-			;;
-		esac
-		shift
-	done
-}
-
-################################################################################
-# REPOSITORY CONFIGURATION
-################################################################################
-
-__configure_repositories() {
-	__log_info "Configuring Proxmox repositories..."
-
-	PROXMOX_DEBIAN_CODENAME=$(__get_debian_codename)
-	__log_info "Detected: Proxmox VE $PROXMOX_PVE_MAJOR_VERSION (Debian $PROXMOX_DEBIAN_CODENAME)"
-
-	if [ "$PROXMOX_PVE_MAJOR_VERSION" -ge 9 ]; then
-		__configure_repositories_deb822
-	else
-		__configure_repositories_legacy
-	fi
-	__configure_firmware_warning_suppression
-
-	__log_info "Updating package lists..."
-	DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1 || {
-		__log_error "Failed to update package lists"
-		return 1
-	}
-
-	__log_success "Repositories configured"
-	__add_summary "Configured Proxmox repositories with no-subscription defaults"
-}
-
-__configure_firmware_warning_suppression() {
-	__backup_file "/etc/apt/apt.conf.d/99-proxmox-bootstrap-firmware-warning"
-	cat >/etc/apt/apt.conf.d/99-proxmox-bootstrap-firmware-warning <<-EOF
-		APT::Get::Update::SourceListWarnings::NonFreeFirmware "false";
-	EOF
-}
-
-__configure_repositories_deb822() {
-	__backup_file "/etc/apt/sources.list"
-	: >/etc/apt/sources.list
-
-	__backup_file "/etc/apt/sources.list.d/debian.sources"
-	cat >/etc/apt/sources.list.d/debian.sources <<-EOF
-		Types: deb
-		URIs: http://deb.debian.org/debian/
-		Suites: ${PROXMOX_DEBIAN_CODENAME} ${PROXMOX_DEBIAN_CODENAME}-updates
-		Components: main contrib non-free non-free-firmware
-		Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
-
-		Types: deb
-		URIs: http://security.debian.org/debian-security/
-		Suites: ${PROXMOX_DEBIAN_CODENAME}-security
-		Components: main contrib non-free non-free-firmware
-		Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
-	EOF
-
-	__backup_file "/etc/apt/sources.list.d/pve-enterprise.sources"
-	cat >/etc/apt/sources.list.d/pve-enterprise.sources <<-EOF
-		# Types: deb
-		# URIs: https://enterprise.proxmox.com/debian/pve
-		# Suites: ${PROXMOX_DEBIAN_CODENAME}
-		# Components: pve-enterprise
-		# Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
-	EOF
-
-	if [ -f "/etc/apt/sources.list.d/pve-install-repo.sources" ]; then
-		__backup_file "/etc/apt/sources.list.d/pve-install-repo.sources"
-		: >/etc/apt/sources.list.d/pve-install-repo.sources
-	fi
-
-	cat >/etc/apt/sources.list.d/pve-no-subscription.sources <<-EOF
-		Types: deb
-		URIs: http://download.proxmox.com/debian/pve
-		Suites: ${PROXMOX_DEBIAN_CODENAME}
-		Components: pve-no-subscription
-		Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
-	EOF
-
-	if [ -f "/etc/apt/sources.list.d/ceph.sources" ]; then
-		__backup_file "/etc/apt/sources.list.d/ceph.sources"
-		: >/etc/apt/sources.list.d/ceph.sources
-	fi
-}
-
-__configure_repositories_legacy() {
-	__backup_file "/etc/apt/sources.list"
-	cat >/etc/apt/sources.list <<-EOF
-		deb http://deb.debian.org/debian ${PROXMOX_DEBIAN_CODENAME} main contrib non-free non-free-firmware
-		deb http://deb.debian.org/debian ${PROXMOX_DEBIAN_CODENAME}-updates main contrib non-free non-free-firmware
-		deb http://security.debian.org/debian-security ${PROXMOX_DEBIAN_CODENAME}-security main contrib non-free non-free-firmware
-	EOF
-
-	__backup_file "/etc/apt/sources.list.d/pve-enterprise.list"
-	echo "# deb https://enterprise.proxmox.com/debian/pve ${PROXMOX_DEBIAN_CODENAME} pve-enterprise" >/etc/apt/sources.list.d/pve-enterprise.list
-
-	if [ -f "/etc/apt/sources.list.d/pve-install-repo.list" ]; then
-		__backup_file "/etc/apt/sources.list.d/pve-install-repo.list"
-		: >/etc/apt/sources.list.d/pve-install-repo.list
-	fi
-
-	cat >/etc/apt/sources.list.d/pve-no-subscription.list <<-EOF
-		deb http://download.proxmox.com/debian/pve ${PROXMOX_DEBIAN_CODENAME} pve-no-subscription
-	EOF
-
-	if [ -f "/etc/apt/sources.list.d/ceph.list" ]; then
-		__backup_file "/etc/apt/sources.list.d/ceph.list"
-		: >/etc/apt/sources.list.d/ceph.list
-	fi
-}
-
-################################################################################
-# PACKAGE INSTALLATION
-################################################################################
-
-__install_package() {
-	local pkg="$1"
-
-	if dpkg -s "$pkg" >/dev/null 2>&1; then
-		return 0
-	fi
-
-	__log_info "Installing $pkg..."
-	__run_apt_noninteractive apt-get install -y --no-install-recommends \
-		-o Dpkg::Options::="--force-confdef" \
-		-o Dpkg::Options::="--force-confold" \
-		"$pkg" || {
-		__log_error "Failed to install: $pkg"
-		return 1
-	}
-	__log_success "Installed $pkg"
-}
-
-__install_packages() {
-	__log_info "Installing packages..."
-
-	local base_packages="vim sudo curl wget ca-certificates net-tools iproute2 iputils-ping screen jq bash-completion gawk rsync openssl"
-	local network_packages="nftables bridge-utils ifupdown2"
-	local service_packages="fail2ban apparmor apparmor-utils"
-	local optional_packages=""
-
-	if [ "$DNS_SERVER_TYPE" = "local" ]; then
-		service_packages="${service_packages} bind9 bind9-utils dnsutils"
-	else
-		base_packages="${base_packages} dnsutils"
-	fi
-
-	if [ "$DHCP_SERVER_TYPE" = "local" ]; then
-		service_packages="${service_packages} isc-dhcp-server"
-	elif [ "$DHCP_SERVER_TYPE" = "relay" ]; then
-		service_packages="${service_packages} isc-dhcp-relay"
-	fi
-
-	if [ "$RA_SERVER_TYPE" = "local" ]; then
-		service_packages="${service_packages} radvd"
-	fi
-
-	if __is_enabled "$CONFIGURE_POSTFIX" && [ "$POSTFIX_SERVER_TYPE" != "forward" ]; then
-		optional_packages="${optional_packages} postfix mailutils"
-	fi
-
-	if __is_enabled "$CONFIGURE_SDN"; then
-		optional_packages="${optional_packages} libpve-network-perl"
-	fi
-	optional_packages="${optional_packages} nginx"
-
-	for pkg in $base_packages $network_packages $service_packages $optional_packages; do
-		__install_package "$pkg" || true
-	done
-
-	__log_success "Package installation complete"
-}
-
-__upgrade_system() {
-	__log_info "Applying non-interactive package upgrade..."
-
-	__run_apt_noninteractive apt-get dist-upgrade -y \
-		-o Dpkg::Options::="--force-confdef" \
-		-o Dpkg::Options::="--force-confold" || {
-		__log_error "Failed to complete package upgrade"
-		return 1
-	}
-
-	__log_success "System packages upgraded"
-	__add_summary "Applied non-interactive package upgrade"
-}
-
-__configure_kernel_policy() {
-	if ! __is_enabled "$PIN_NEWEST_PVE_KERNEL" && [ "${PVE_KERNEL_KEEP_COUNT:-0}" -lt 1 ]; then
-		return 0
-	fi
-
-	local packages versions newest current backup pkg version
-	packages="$(__list_installed_pve_kernel_packages)"
-	if [ -z "$packages" ]; then
-		__log_info "No installed Proxmox kernel image packages detected"
-		return 0
-	fi
-
-	versions="$(
-		printf '%s\n' "$packages" |
-			while IFS= read -r pkg; do
-				__kernel_version_from_package "$pkg"
-			done | awk 'NF' | sort -Vu
-	)"
-	newest="$(printf '%s\n' "$versions" | tail -1)"
-	current="$(uname -r)"
-	backup=""
-
-	if [ "${PVE_KERNEL_KEEP_COUNT:-2}" -gt 1 ]; then
-		if printf '%s\n' "$versions" | grep -Fxq -- "$current" && [ "$current" != "$newest" ]; then
-			backup="$current"
-		else
-			backup="$(printf '%s\n' "$versions" | grep -Fvx -- "$newest" | tail -1 || true)"
-		fi
-	fi
-
-	__log_info "Applying Proxmox kernel policy..."
-	if __is_enabled "$PIN_NEWEST_PVE_KERNEL" && __command_exists proxmox-boot-tool; then
-		proxmox-boot-tool kernel pin "$newest" >/dev/null 2>&1 || {
-			__log_error "Failed to pin newest installed kernel: $newest"
-			return 1
+	__log_info "Adding ${short} (${addr}) to /etc/hosts so pmxcfs can resolve the node name..."
+	__backup_file /etc/hosts
+	hosts_tmp="$(mktemp)"
+	awk -v fqdn="$fqdn" -v short="$short" '
+		/^[[:space:]]*#/ || NF == 0 { print; next }
+		$1 ~ /^127\./ || $1 == "::1" {
+			line = $1
+			names = 0
+			for (i = 2; i <= NF; i++) if ($i != fqdn && $i != short) { line = line " " $i; names++ }
+			if (names > 0) print line
+			next
 		}
-		__add_summary "Pinned newest installed kernel: ${newest}"
-	fi
-
-	local -a remove_pkgs=()
-	while IFS= read -r pkg; do
-		version="$(__kernel_version_from_package "$pkg")"
-		if [ "$version" = "$newest" ] || { [ -n "$backup" ] && [ "$version" = "$backup" ]; }; then
-			continue
-		fi
-		remove_pkgs+=("$pkg")
-	done <<-EOF
-	$packages
-	EOF
-
-	if [ "${#remove_pkgs[@]}" -gt 0 ]; then
-		DEBIAN_FRONTEND=noninteractive apt-get purge -y "${remove_pkgs[@]}" >/dev/null 2>&1 || {
-			__log_error "Failed to remove old Proxmox kernel packages"
-			return 1
-		}
-		__add_summary "Removed old Proxmox kernel packages: ${remove_pkgs[*]}"
-	fi
-
-	if __command_exists proxmox-boot-tool; then
-		proxmox-boot-tool refresh >/dev/null 2>&1 || {
-			__log_error "Failed to refresh proxmox-boot-tool after kernel changes"
-			return 1
-		}
-	fi
-
-	__configure_nested_virtualization
-
-	if [ -n "$backup" ]; then
-		__add_summary "Retained Proxmox kernels: ${newest}, ${backup}"
-	else
-		__add_summary "Retained Proxmox kernel: ${newest}"
-	fi
-
-	__log_success "Proxmox kernel policy applied"
+		{ print }
+	' /etc/hosts >"$hosts_tmp"
+	printf '%s %s %s\n' "$addr" "$fqdn" "$short" >>"$hosts_tmp"
+	cat "$hosts_tmp" >/etc/hosts
+	rm -f "$hosts_tmp"
+	__add_summary "Added ${short} (${addr}) to /etc/hosts"
 }
 
-################################################################################
-# NETWORK CONFIGURATION
-################################################################################
-
-__is_network_configured() {
-	__lan_bridge_uses_target_port || return 1
-	__router_bridge_uses_target_port || return 1
-	__router_bridge_vlan_aware_configured || return 1
-
-	if $PROXMOX_SINGLE_NIC_MODE; then
-		ip link show "$LAN_NIC" >/dev/null 2>&1 && ip link show "$LAN_BR" >/dev/null 2>&1
-	else
-		ip link show "$WAN_BR" >/dev/null 2>&1 && ip link show "$LAN_BR" >/dev/null 2>&1 && { [ -z "$ROUTER_BR" ] || ip link show "$ROUTER_BR" >/dev/null 2>&1; }
-	fi
-}
-
-__configure_network() {
-	if __is_network_configured; then
-		__log_info "Network already configured, skipping"
+__ensure_pve_cluster() {
+	if systemctl is-active --quiet pve-cluster && [ -d /etc/pve/nodes ]; then
 		return 0
 	fi
 
-	__log_info "Configuring network interfaces..."
+	__log_info "Starting pve-cluster so /etc/pve is available..."
+	systemctl reset-failed pve-cluster >/dev/null 2>&1 || true
+	systemctl start pve-cluster || __log_fatal "pve-cluster could not be started; see journalctl -u pve-cluster (the node name must resolve to a non-loopback IP in /etc/hosts)"
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		[ -d /etc/pve/nodes ] && break
+		sleep 1
+	done
+	[ -d /etc/pve/nodes ] || __log_fatal "pve-cluster started but /etc/pve/nodes is still missing"
+}
 
-	__configure_network_additive
+__ensure_pve_node_dir() {
+	local target current count
+	target="$(__get_target_node_name)"
 
-	__log_info "Reloading network configuration (may cause brief disconnection)..."
-	__reload_network_config || __log_warn "network reload reported errors"
-
-	if ! __is_network_configured && __command_exists ifup; then
-		if __is_dummy_lan_iface "$LAN_NIC"; then
-			ifup "$LAN_NIC" 2>/dev/null || true
-		fi
-		if __is_router_dummy_iface "$ROUTER_NIC"; then
-			ifup "$ROUTER_NIC" 2>/dev/null || true
-		fi
-		ifup "$LAN_BR" 2>/dev/null || true
-		[ -n "$ROUTER_BR" ] && ifup "$ROUTER_BR" 2>/dev/null || true
+	if [ -d "/etc/pve/nodes/${target}" ]; then
+		return 0
 	fi
 
-	if __is_network_configured; then
-		__log_success "Network configured successfully"
+	count="$(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+	current="$(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n1)"
+
+	if [ "$count" -eq 1 ] && { [ ! -f /etc/pve/corosync.conf ] || __is_enabled "$FORCE_NODE_RENAME"; }; then
+		mv "/etc/pve/nodes/${current}" "/etc/pve/nodes/${target}" || __log_fatal "Could not move /etc/pve/nodes/${current} to ${target}"
+		__log_success "Moved Proxmox node directory ${current} to ${target}"
+		__add_summary "Renamed Proxmox node directory ${current} to ${target}"
 	else
-		__log_error "Network configuration may have failed"
-		return 1
+		__log_fatal "Proxmox node directory /etc/pve/nodes/${target} is missing and cannot be moved safely (found ${count} node directories; clustered hosts need FORCE_NODE_RENAME=yes)"
 	fi
 }
 
-__configure_network_additive() {
-	__backup_file "/etc/network/interfaces"
+__ensure_pve_cert() {
+	local pve_cert pve_key
+	pve_cert="/etc/pve/local/pve-ssl.pem"
+	pve_key="/etc/pve/local/pve-ssl.key"
 
-	if __is_dummy_lan_iface "$LAN_NIC"; then
-		modprobe dummy 2>/dev/null || true
-		if ! grep -q -- "^dummy$" /etc/modules 2>/dev/null; then
-			echo "dummy" >>/etc/modules
-		fi
-
-		if ! ip link show "$LAN_NIC" >/dev/null 2>&1; then
-			ip link add "$LAN_NIC" type dummy || true
-		fi
+	if [ -f "$pve_cert" ] && [ -f "$pve_key" ]; then
+		return 0
 	fi
 
-	if __is_router_dummy_iface "$ROUTER_NIC"; then
-		modprobe dummy 2>/dev/null || true
-		if ! grep -q -- "^dummy$" /etc/modules 2>/dev/null; then
-			echo "dummy" >>/etc/modules
-		fi
+	__command_exists pvecm || __log_fatal "Missing Proxmox SSL certificate and pvecm is not available to create it"
+	__log_info "Proxmox SSL certificate missing; generating with pvecm updatecerts..."
+	pvecm updatecerts --force || __log_fatal "Failed to generate Proxmox SSL certificate"
+	systemctl restart pveproxy >/dev/null 2>&1 || true
 
-		if ! ip link show "$ROUTER_NIC" >/dev/null 2>&1; then
-			ip link add "$ROUTER_NIC" type dummy || true
-		fi
-	fi
-
-	if ! grep -q -- "^auto ${WAN_BR}$" /etc/network/interfaces 2>/dev/null && [ -n "$WAN_NIC" ] && { [ -n "$WAN_V4" ] || [ -n "$WAN_V6" ]; }; then
-		__append_wan_bridge
-	fi
-
-	if ! grep -q -- "^auto ${LAN_NIC}$" /etc/network/interfaces 2>/dev/null; then
-		__append_manual_iface "$LAN_NIC"
-	fi
-
-	if ! grep -q -- "^auto ${LAN_BR}$" /etc/network/interfaces 2>/dev/null; then
-		__append_lan_bridge
-	fi
-
-	__ensure_lan_bridge_settings
-
-	if [ -n "$ROUTER_NIC" ] && ! grep -q -- "^auto ${ROUTER_NIC}$" /etc/network/interfaces 2>/dev/null; then
-		__append_manual_iface "$ROUTER_NIC"
-	fi
-
-	if [ -n "$ROUTER_BR" ] && ! grep -q -- "^auto ${ROUTER_BR}$" /etc/network/interfaces 2>/dev/null; then
-		__append_router_bridge
-	fi
-
-	__ensure_router_bridge_settings
-
-	if ! grep -q -- "^source /etc/network/interfaces.d/\*" /etc/network/interfaces 2>/dev/null; then
-		printf '\nsource /etc/network/interfaces.d/*\n' >>/etc/network/interfaces
-	fi
+	[ -f "$pve_cert" ] || __log_fatal "Missing Proxmox SSL certificate after pvecm updatecerts: $pve_cert"
+	[ -f "$pve_key" ] || __log_fatal "Missing Proxmox SSL key after pvecm updatecerts: $pve_key"
+	__add_summary "Generated Proxmox SSL certificate with pvecm updatecerts"
 }
 
-__append_manual_iface() {
-	local iface="$1"
-	if __is_dummy_lan_iface "$iface"; then
-		cat >>/etc/network/interfaces <<-EOF
-
-			auto ${iface}
-			iface ${iface} inet manual
-			    pre-up ip link add ${iface} type dummy 2>/dev/null || true
-		EOF
-	else
-		cat >>/etc/network/interfaces <<-EOF
-
-			auto ${iface}
-			iface ${iface} inet manual
-		EOF
-	fi
+__proxmox_init() {
+	__log_info "Initializing Proxmox node..."
+	__ensure_node_hosts_entry
+	__ensure_pve_cluster
+	__ensure_pve_node_dir
+	__ensure_pve_cert
+	__log_success "Proxmox node initialized"
 }
-
-__append_wan_bridge() {
-	cat >>/etc/network/interfaces <<-EOF
-
-		auto ${WAN_BR}
-		iface ${WAN_BR} inet static
-		    address ${WAN_V4}
-		    broadcast ${WAN_V4_BRD}
-		    gateway ${WAN_V4_GW}
-		    bridge-ports ${WAN_NIC}
-		    bridge-stp off
-		    bridge-fd 0
-		    # Proxmox bootstrap WAN bridge for host uplink
-	EOF
-	if [ -n "$WAN_V6" ]; then
-		cat >>/etc/network/interfaces <<-EOF
-
-			iface ${WAN_BR} inet6 static
-			    address ${WAN_V6}
-			    gateway ${WAN_V6_GW}
-		EOF
-	fi
-}
-
-__append_lan_bridge() {
-	cat >>/etc/network/interfaces <<-EOF
-
-		auto ${LAN_BR}
-		iface ${LAN_BR} inet static
-		    address ${LAN_V4}
-		    broadcast ${LAN_V4_BRD}
-		    bridge-ports ${LAN_NIC}
-		    bridge-stp off
-		    bridge-fd 0
-		    # Proxmox bootstrap LAN bridge for guests
-
-		iface ${LAN_BR} inet6 static
-		    address ${LAN_V6_ROUTER_IP}/64
-	EOF
-}
-
-__append_router_bridge() {
-	cat >>/etc/network/interfaces <<-EOF
-
-		auto ${ROUTER_BR}
-		iface ${ROUTER_BR} inet manual
-		    bridge-ports ${ROUTER_NIC}
-		    bridge-stp off
-		    bridge-fd 0
-		    bridge-vlan-aware yes
-		    # Proxmox bootstrap router-lab bridge for pfSense and downstream guests
-	EOF
-}
-
-################################################################################
-# MAIN EXECUTION
-################################################################################
 
 ################################################################################
 # SYSCTL CONFIGURATION
@@ -2431,6 +2315,72 @@ __configure_sysctl() {
 	sysctl --system >/dev/null 2>&1
 
 	__log_success "System parameters configured"
+}
+
+################################################################################
+# APPARMOR AND NESTED VIRTUALIZATION
+################################################################################
+
+__configure_nested_virtualization() {
+	if ! __is_enabled "$ENABLE_NESTED_VIRT"; then
+		return 0
+	fi
+
+	local module nested_value nested_param current_value
+	module=""
+	nested_value=""
+	if grep -qi -- 'AuthenticAMD' /proc/cpuinfo 2>/dev/null; then
+		module="kvm_amd"
+		nested_value="1"
+	elif grep -qi -- 'GenuineIntel' /proc/cpuinfo 2>/dev/null; then
+		module="kvm_intel"
+		nested_value="Y"
+	else
+		return 0
+	fi
+
+	mkdir -p /etc/modprobe.d
+	__backup_file /etc/modprobe.d/proxmox-bootstrap-kvm.conf
+	printf 'options %s nested=%s\n' "$module" "$nested_value" >/etc/modprobe.d/proxmox-bootstrap-kvm.conf
+
+	modprobe "$module" >/dev/null 2>&1 || true
+	nested_param="/sys/module/${module}/parameters/nested"
+	if [ -w "$nested_param" ]; then
+		current_value="$(cat "$nested_param" 2>/dev/null || true)"
+		if [ "$current_value" != "$nested_value" ]; then
+			printf '%s' "$nested_value" >"$nested_param" 2>/dev/null || true
+		fi
+	fi
+
+	current_value="$(cat "$nested_param" 2>/dev/null || true)"
+	case "$current_value" in
+	1 | Y | y)
+		__add_summary "Enabled nested virtualization for ${module}"
+		;;
+	*)
+		__log_warn "Nested virtualization for ${module} is configured but may require a reboot or module reload"
+		;;
+	esac
+}
+
+__configure_apparmor() {
+	__log_info "Configuring AppArmor..."
+
+	if ! __command_exists aa-status; then
+		__log_info "AppArmor tools not installed yet, skipping profile reload"
+		return 0
+	fi
+
+	__unmask_service_if_needed apparmor
+	systemctl enable apparmor >/dev/null 2>&1 || true
+	systemctl start apparmor >/dev/null 2>&1 || true
+
+	for profile in /etc/apparmor.d/usr.sbin.named /etc/apparmor.d/usr.sbin.dhcpd /etc/apparmor.d/usr.sbin.radvd /etc/apparmor.d/usr.sbin.postfix; do
+		[ -f "$profile" ] || continue
+		apparmor_parser -r "$profile" >/dev/null 2>&1 || __log_warn "Could not reload AppArmor profile: $profile"
+	done
+
+	__log_success "AppArmor configured"
 }
 
 ################################################################################
@@ -3183,6 +3133,64 @@ __configure_postfix() {
 	fi
 	if [ "$POSTFIX_SERVER_TYPE" = "relay" ] || [ "$POSTFIX_SERVER_TYPE" = "satellite" ]; then
 		__add_summary "Configured Postfix relay via ${POSTFIX_SMTP_RELAY}:${POSTFIX_SMTP_PORT}"
+	fi
+}
+
+################################################################################
+# TLS CERTIFICATES
+################################################################################
+
+__configure_letsencrypt_pve_cert_hook() {
+	local fqdn hook_dir hook_file le_dir
+	fqdn="$(__get_host_fqdn)"
+	hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+	hook_file="${hook_dir}/proxmox-bootstrap-copy-pve-cert"
+	le_dir=""
+
+	if [ -d /etc/letsencrypt/live/domain ]; then
+		le_dir="/etc/letsencrypt/live/domain"
+	elif [ -d "/etc/letsencrypt/live/${fqdn}" ]; then
+		le_dir="/etc/letsencrypt/live/${fqdn}"
+	fi
+
+	mkdir -p "$hook_dir"
+	__backup_file "$hook_file"
+	cat >"$hook_file" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+	lineage="${RENEWED_LINEAGE:-}"
+	if [ -z "$lineage" ]; then
+		for candidate in "/etc/letsencrypt/live/domain" "/etc/letsencrypt/live/$(hostname -f 2>/dev/null || hostname)"; do
+			[ -d "$candidate" ] || continue
+			lineage="$candidate"
+			break
+		done
+	fi
+
+	[ -n "$lineage" ] || exit 0
+	[ -f "${lineage}/fullchain.pem" ] || exit 0
+	[ -f "${lineage}/privkey.pem" ] || exit 0
+
+	cert_tmp="$(mktemp)"
+	key_tmp="$(mktemp)"
+	trap 'rm -f "$cert_tmp" "$key_tmp"' EXIT
+
+	cp "${lineage}/fullchain.pem" "$cert_tmp"
+	cp "${lineage}/privkey.pem" "$key_tmp"
+	cp "$cert_tmp" /etc/pve/local/pve-ssl.pem
+	cp "$key_tmp" /etc/pve/local/pve-ssl.key
+
+	systemctl reload-or-restart pveproxy >/dev/null 2>&1 || systemctl restart pveproxy >/dev/null 2>&1 || true
+	if systemctl is-active --quiet nginx; then
+		systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+	fi
+EOF
+	chmod 750 "$hook_file"
+
+	if [ -n "$le_dir" ] && [ -f "${le_dir}/fullchain.pem" ] && [ -f "${le_dir}/privkey.pem" ]; then
+		"$hook_file" || __log_fatal "Failed to copy Let's Encrypt certificates from ${le_dir}"
+		__add_summary "Synced Let's Encrypt certificates from ${le_dir} into Proxmox"
 	fi
 }
 
