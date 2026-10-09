@@ -1045,12 +1045,91 @@ __configure_node_name() {
 		sed -i "s/\b${current_node}\b/${PVE_NODE_NAME}/g" /etc/mailname
 	fi
 
-	if [ -d "/etc/pve/nodes/${current_node}" ] && [ ! -e "/etc/pve/nodes/${PVE_NODE_NAME}" ]; then
-		mv "/etc/pve/nodes/${current_node}" "/etc/pve/nodes/${PVE_NODE_NAME}" || __log_warn "Could not move /etc/pve/nodes/${current_node}"
-	fi
-
 	POSTFIX_MYHOSTNAME="${PVE_NODE_NAME}.${LAN_DOMAIN}"
 	__log_success "Node rename applied; reboot may be required for all Proxmox services"
+}
+
+__get_primary_ip() {
+	local addr
+	addr="$(ip -4 -o route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
+	if [ -z "$addr" ]; then
+		addr="$(hostname -I 2>/dev/null | awk '{ print $1 }')"
+	fi
+	echo "$addr"
+}
+
+__get_target_node_name() {
+	echo "${PVE_NODE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
+}
+
+__ensure_node_hosts_entry() {
+	local short fqdn addr hosts_tmp has_entry
+	short="$(__get_target_node_name)"
+	fqdn="${short}.${LAN_DOMAIN}"
+
+	has_entry='$1 !~ /^#/ && $1 !~ /^127\./ && $1 != "::1" {'
+	has_entry="${has_entry} for (i = 2; i <= NF; i++) if (\$i == name) found = 1"
+	has_entry="${has_entry} } END { exit !found }"
+	if awk -v name="$short" "$has_entry" /etc/hosts; then
+		return 0
+	fi
+
+	addr="$(__get_primary_ip)"
+	[ -n "$addr" ] || __log_fatal "Could not determine a non-loopback IP address for node ${short}"
+
+	__log_info "Adding ${short} (${addr}) to /etc/hosts so pmxcfs can resolve the node name..."
+	__backup_file /etc/hosts
+	hosts_tmp="$(mktemp)"
+	awk -v fqdn="$fqdn" -v short="$short" '
+		/^[[:space:]]*#/ || NF == 0 { print; next }
+		$1 ~ /^127\./ || $1 == "::1" {
+			line = $1
+			names = 0
+			for (i = 2; i <= NF; i++) if ($i != fqdn && $i != short) { line = line " " $i; names++ }
+			if (names > 0) print line
+			next
+		}
+		{ print }
+	' /etc/hosts >"$hosts_tmp"
+	printf '%s %s %s\n' "$addr" "$fqdn" "$short" >>"$hosts_tmp"
+	cat "$hosts_tmp" >/etc/hosts
+	rm -f "$hosts_tmp"
+	__add_summary "Added ${short} (${addr}) to /etc/hosts"
+}
+
+__ensure_pve_cluster() {
+	if systemctl is-active --quiet pve-cluster && [ -d /etc/pve/nodes ]; then
+		return 0
+	fi
+
+	__log_info "Starting pve-cluster so /etc/pve is available..."
+	systemctl reset-failed pve-cluster >/dev/null 2>&1 || true
+	systemctl start pve-cluster || __log_fatal "pve-cluster could not be started; see journalctl -u pve-cluster (the node name must resolve to a non-loopback IP in /etc/hosts)"
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		[ -d /etc/pve/nodes ] && break
+		sleep 1
+	done
+	[ -d /etc/pve/nodes ] || __log_fatal "pve-cluster started but /etc/pve/nodes is still missing"
+}
+
+__ensure_pve_node_dir() {
+	local target current count
+	target="$(__get_target_node_name)"
+
+	if [ -d "/etc/pve/nodes/${target}" ]; then
+		return 0
+	fi
+
+	count="$(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+	current="$(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n1)"
+
+	if [ "$count" -eq 1 ] && { [ ! -f /etc/pve/corosync.conf ] || __is_enabled "$FORCE_NODE_RENAME"; }; then
+		mv "/etc/pve/nodes/${current}" "/etc/pve/nodes/${target}" || __log_fatal "Could not move /etc/pve/nodes/${current} to ${target}"
+		__log_success "Moved Proxmox node directory ${current} to ${target}"
+		__add_summary "Renamed Proxmox node directory ${current} to ${target}"
+	else
+		__log_fatal "Proxmox node directory /etc/pve/nodes/${target} is missing and cannot be moved safely (found ${count} node directories; clustered hosts need FORCE_NODE_RENAME=yes)"
+	fi
 }
 
 __ensure_pve_cert() {
@@ -1070,6 +1149,15 @@ __ensure_pve_cert() {
 	[ -f "$pve_cert" ] || __log_fatal "Missing Proxmox SSL certificate after pvecm updatecerts: $pve_cert"
 	[ -f "$pve_key" ] || __log_fatal "Missing Proxmox SSL key after pvecm updatecerts: $pve_key"
 	__add_summary "Generated Proxmox SSL certificate with pvecm updatecerts"
+}
+
+__proxmox_init() {
+	__log_info "Initializing Proxmox node..."
+	__ensure_node_hosts_entry
+	__ensure_pve_cluster
+	__ensure_pve_node_dir
+	__ensure_pve_cert
+	__log_success "Proxmox node initialized"
 }
 
 __get_debian_codename() {
@@ -3651,10 +3739,10 @@ __main() {
 	__load_config_file
 	__detect_pve_version
 	__configure_node_name
-	__ensure_pve_cert
 	__detect_network_interfaces
 	__check_ip_conflicts
 	__run_task network __configure_network
+	__proxmox_init
 	__run_task repositories __configure_repositories
 	if __is_enabled "$AUTO_DIST_UPGRADE"; then
 		__run_task system_upgrade __upgrade_system

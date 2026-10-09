@@ -47,7 +47,7 @@ chmod +x install.sh
 --clear-state [task]   Clear all task state or one named task and exit 0
 --reset                Remove bootstrap-managed configuration and state
 --force                Re-run tasks even when state says complete
---debug                Enable debug output
+--debug                Trace every command with set -x (output may include secrets)
 --color auto|yes|no    Control color output (default: auto)
 --version, -v          Print version and exit
 ```
@@ -302,9 +302,10 @@ Legacy variables such as `MAIL_RELAY_HOST`, `MAIL_RELAY_PORT`, and `ROOT_MAIL_FO
 - `nginx` is configured as a reverse proxy in front of the Proxmox UI
 - `/etc/nginx/*` is rebuilt during bootstrap while preserving `mime.types`
 - The generated vhost lives at `/etc/nginx/vhosts.d/{fqdn}.conf`
-- HTTP redirects to HTTPS and HTTPS proxies to `https://127.0.0.1:8006`
-- The proxy uses the Proxmox node certificate files in `/etc/pve/local/pve-ssl.pem` and `/etc/pve/local/pve-ssl.key`
-- If `/etc/letsencrypt/live/domain` exists, the bootstrap installs a Certbot deploy hook that copies `fullchain.pem` and `privkey.pem` into the Proxmox certificate files without symlinks and reloads `pveproxy` and `nginx`
+- HTTP redirects to HTTPS and HTTPS proxies to the `pveproxy` upstream, which points at `{fqdn}:8006`, so the host FQDN must resolve to the Proxmox host
+- Right after the network step, the bootstrap makes sure the node name resolves in `/etc/hosts`, starts `pve-cluster`, aligns `/etc/pve/nodes/{node}` with the node name, and regenerates a missing `pve-ssl.pem` or `pve-ssl.key` with `pvecm updatecerts --force`
+- nginx serves a Let's Encrypt certificate from `/etc/letsencrypt/live/domain` or `/etc/letsencrypt/live/{fqdn}` when one exists, otherwise the Proxmox node certificate in `/etc/pve/local/`
+- When a Let's Encrypt directory exists, the bootstrap also installs a Certbot deploy hook that copies `fullchain.pem` and `privkey.pem` into the Proxmox certificate files without symlinks and reloads `pveproxy` and `nginx`
 
 ### Firewall
 

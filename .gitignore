@@ -104,8 +104,3 @@ core.[0-9]*
 # ignore work in progress files
 **/*.rewrite.sh
 **/*.refactor.sh
-
-# ignore AI files
-AI.md
-TODO.AI.md
-
