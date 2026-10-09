@@ -1053,6 +1053,25 @@ __configure_node_name() {
 	__log_success "Node rename applied; reboot may be required for all Proxmox services"
 }
 
+__ensure_pve_cert() {
+	local pve_cert pve_key
+	pve_cert="/etc/pve/local/pve-ssl.pem"
+	pve_key="/etc/pve/local/pve-ssl.key"
+
+	if [ -f "$pve_cert" ] && [ -f "$pve_key" ]; then
+		return 0
+	fi
+
+	__command_exists pvecm || __log_fatal "Missing Proxmox SSL certificate and pvecm is not available to create it"
+	__log_info "Proxmox SSL certificate missing; generating with pvecm updatecerts..."
+	pvecm updatecerts --force || __log_fatal "Failed to generate Proxmox SSL certificate"
+	systemctl restart pveproxy >/dev/null 2>&1 || true
+
+	[ -f "$pve_cert" ] || __log_fatal "Missing Proxmox SSL certificate after pvecm updatecerts: $pve_cert"
+	[ -f "$pve_key" ] || __log_fatal "Missing Proxmox SSL key after pvecm updatecerts: $pve_key"
+	__add_summary "Generated Proxmox SSL certificate with pvecm updatecerts"
+}
+
 __get_debian_codename() {
 	if [ -f /etc/os-release ]; then
 		# shellcheck disable=SC1091
@@ -3632,6 +3651,7 @@ __main() {
 	__load_config_file
 	__detect_pve_version
 	__configure_node_name
+	__ensure_pve_cert
 	__detect_network_interfaces
 	__check_ip_conflicts
 	__run_task network __configure_network
