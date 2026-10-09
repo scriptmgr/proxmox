@@ -2183,39 +2183,50 @@ __get_target_node_name() {
 	echo "${PVE_NODE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
 }
 
+__is_local_ip() {
+	ip -o addr show 2>/dev/null | awk -v addr="$1" '{ split($4, a, "/"); if (a[1] == addr) found = 1 } END { exit !found }'
+}
+
+__get_node_ip() {
+	local addr
+	addr="$(__get_primary_ip)"
+	if [ -z "$addr" ] && [ -n "${LAN_V4_IP:-}" ] && __is_local_ip "$LAN_V4_IP"; then
+		addr="$LAN_V4_IP"
+	fi
+	echo "$addr"
+}
+
 __ensure_node_hosts_entry() {
-	local short fqdn addr hosts_tmp has_entry
+	local short fqdn addr current hosts_tmp current_cmd
 	short="$(__get_target_node_name)"
 	fqdn="${short}.${LAN_DOMAIN}"
 
-	has_entry='$1 !~ /^#/ && $1 !~ /^127\./ && $1 != "::1" {'
-	has_entry="${has_entry} for (i = 2; i <= NF; i++) if (\$i == name) found = 1"
-	has_entry="${has_entry} } END { exit !found }"
-	if awk -v name="$short" "$has_entry" /etc/hosts; then
+	addr="$(__get_node_ip)"
+	[ -n "$addr" ] || __log_fatal "Could not determine a non-loopback IP address for node ${short}"
+
+	current_cmd='$1 !~ /^#/ && $1 !~ /^127\./ && $1 != "::1" {'
+	current_cmd="${current_cmd} for (i = 2; i <= NF; i++) if (\$i == name) { print \$1; exit } }"
+	current="$(awk -v name="$short" "$current_cmd" /etc/hosts)"
+	if [ -n "$current" ] && __is_local_ip "$current"; then
 		return 0
 	fi
 
-	addr="$(__get_primary_ip)"
-	[ -n "$addr" ] || __log_fatal "Could not determine a non-loopback IP address for node ${short}"
-
-	__log_info "Adding ${short} (${addr}) to /etc/hosts so pmxcfs can resolve the node name..."
+	__log_info "Mapping ${short} to ${addr} in /etc/hosts so pmxcfs can resolve the node name..."
 	__backup_file /etc/hosts
 	hosts_tmp="$(mktemp)"
 	awk -v fqdn="$fqdn" -v short="$short" '
 		/^[[:space:]]*#/ || NF == 0 { print; next }
-		$1 ~ /^127\./ || $1 == "::1" {
+		{
 			line = $1
 			names = 0
 			for (i = 2; i <= NF; i++) if ($i != fqdn && $i != short) { line = line " " $i; names++ }
 			if (names > 0) print line
-			next
 		}
-		{ print }
 	' /etc/hosts >"$hosts_tmp"
 	printf '%s %s %s\n' "$addr" "$fqdn" "$short" >>"$hosts_tmp"
 	cat "$hosts_tmp" >/etc/hosts
 	rm -f "$hosts_tmp"
-	__add_summary "Added ${short} (${addr}) to /etc/hosts"
+	__add_summary "Mapped ${short} to ${addr} in /etc/hosts"
 }
 
 __ensure_pve_cluster() {
