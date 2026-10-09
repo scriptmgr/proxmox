@@ -3494,6 +3494,11 @@ __configure_vlan_readiness() {
 # VM/CONTAINER DEFAULTS
 ################################################################################
 
+__net_value_needs_bridge() {
+	local value=",${1}," bridge="$2"
+	[[ "$value" == *,bridge=* && "$value" != *",bridge=${bridge},"* ]]
+}
+
 __replace_bridge_in_config_value() {
 	local value="$1"
 	local bridge="$2"
@@ -3514,7 +3519,7 @@ __configure_vm_defaults() {
 			if [ "$net_count" -eq 1 ]; then
 				net_line="$(grep -E -- '^net[0-9]+:' "$conf" | head -n1)"
 				net_value="${net_line#*: }"
-				if [[ "$net_value" == *bridge=* && "$net_value" != *"bridge=${LAN_BR}"* ]]; then
+				if __net_value_needs_bridge "$net_value" "$LAN_BR"; then
 					updated_value="$(__replace_bridge_in_config_value "$net_value" "$LAN_BR")"
 					qm set "$vmid" --net0 "$updated_value" >/dev/null 2>&1 && vm_updates=$((vm_updates + 1)) || true
 				fi
@@ -3536,7 +3541,7 @@ __configure_vm_defaults() {
 			if [ "$net_count" -eq 1 ]; then
 				net_line="$(grep -E -- '^net[0-9]+:' "$conf" | head -n1)"
 				net_value="${net_line#*: }"
-				if [[ "$net_value" == *bridge=* && "$net_value" != *"bridge=${LAN_BR}"* ]]; then
+				if __net_value_needs_bridge "$net_value" "$LAN_BR"; then
 					updated_value="$(__replace_bridge_in_config_value "$net_value" "$LAN_BR")"
 					pct set "$ctid" --net0 "$updated_value" >/dev/null 2>&1 && ct_updates=$((ct_updates + 1)) || true
 				fi
