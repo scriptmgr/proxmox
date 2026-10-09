@@ -57,9 +57,18 @@ Primary test target (`rtedpro/proxmox:latest`):
 docker run -itd --name proxmoxve --hostname pve -p 8006:8006 --privileged rtedpro/proxmox:latest
 ```
 
+Run the whole sequence with `tests/container-test.sh`. It pulls `PROXMOX_TEST_IMAGE` (default `rtedpro/proxmox:latest`) and runs a three-scenario matrix, each in a fresh privileged container with a random hostname so the test does not only pass for the name baked into the image:
+
+- `random`: random short hostname, node name follows the hostname
+- `node-name`: random hostname plus a different `PVE_NODE_NAME` (the rename path)
+- `fqdn`: random hostname that is already a fully qualified name
+
+Each scenario runs `install.sh` twice (the second run checks idempotency), then runs the validation commands below plus hostname, `/etc/hosts`, `pve-cluster`, node directory, certificate, `nginx -t` and service checks. `--scenario NAME` runs one scenario, `PROXMOX_TEST_HOSTNAME` pins the base hostname to reproduce a failure, and `--keep` leaves containers and logs for inspection. Failed scenarios keep their container; logs go to a temp directory outside the project.
+
 Rules:
 
 - Project verification executes `install.sh` inside that container, not on the host.
+- The container is privileged and shares the host kernel, so `install.sh` kernel-level changes (modules, `kvm` nested parameter) reach the host. Run it on a disposable test machine.
 - Avoid large downloads (ISOs, templates) during automated testing unless explicitly requested; `DOWNLOAD_ISOS` and `DOWNLOAD_TEMPLATES` stay `no`.
 - Remove the container as soon as testing is finished.
 

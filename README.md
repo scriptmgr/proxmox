@@ -486,7 +486,7 @@ Primary test target:
 docker run -itd --name proxmoxve --hostname pve -p 8006:8006 --privileged rtedpro/proxmox:latest
 ```
 
-Project verification should execute `install.sh` inside the declared Proxmox test container, not on the host.
+Project verification should execute `install.sh` inside the declared Proxmox test container, not on the host. `tests/container-test.sh` automates this with a three-scenario matrix (random hostname, random hostname plus `PVE_NODE_NAME`, and an FQDN hostname). Each scenario starts a fresh container, runs `install.sh` twice to check idempotency, runs the validation checks, and removes the container on success. Use `--scenario NAME` to run one, `--keep` to keep containers, and `PROXMOX_TEST_HOSTNAME` to pin a hostname when reproducing a failure. The containers are privileged and share the host kernel, so run it on a disposable test machine.
 
 Typical validation commands inside the container:
 
