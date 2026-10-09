@@ -3514,7 +3514,7 @@ __configure_vm_defaults() {
 			if [ "$net_count" -eq 1 ]; then
 				net_line="$(grep -E -- '^net[0-9]+:' "$conf" | head -n1)"
 				net_value="${net_line#*: }"
-				if echo "$net_value" | grep -q -- 'bridge=' && ! echo "$net_value" | grep -q -- "bridge=${LAN_BR}"; then
+				if [[ "$net_value" == *bridge=* && "$net_value" != *"bridge=${LAN_BR}"* ]]; then
 					updated_value="$(__replace_bridge_in_config_value "$net_value" "$LAN_BR")"
 					qm set "$vmid" --net0 "$updated_value" >/dev/null 2>&1 && vm_updates=$((vm_updates + 1)) || true
 				fi
@@ -3536,7 +3536,7 @@ __configure_vm_defaults() {
 			if [ "$net_count" -eq 1 ]; then
 				net_line="$(grep -E -- '^net[0-9]+:' "$conf" | head -n1)"
 				net_value="${net_line#*: }"
-				if echo "$net_value" | grep -q -- 'bridge=' && ! echo "$net_value" | grep -q -- "bridge=${LAN_BR}"; then
+				if [[ "$net_value" == *bridge=* && "$net_value" != *"bridge=${LAN_BR}"* ]]; then
 					updated_value="$(__replace_bridge_in_config_value "$net_value" "$LAN_BR")"
 					pct set "$ctid" --net0 "$updated_value" >/dev/null 2>&1 && ct_updates=$((ct_updates + 1)) || true
 				fi
