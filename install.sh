@@ -949,6 +949,19 @@ __unmask_service_if_needed() {
 	fi
 }
 
+__enable_restart_service() {
+	local service="$1" level="${2:-fatal}" message="${3:-Failed to restart ${1}}"
+	__unmask_service_if_needed "$service"
+	systemctl enable "$service" >/dev/null 2>&1 || true
+	if ! systemctl restart "$service"; then
+		if [ "$level" = "warn" ]; then
+			__log_warn "$message"
+		else
+			__log_fatal "$message"
+		fi
+	fi
+}
+
 __reload_network_config() {
 	local attempt rc output
 
@@ -2471,9 +2484,7 @@ __configure_fail2ban() {
 		bantime = 1h
 		findtime = 10m
 	EOF
-	__unmask_service_if_needed fail2ban
-	systemctl enable fail2ban >/dev/null 2>&1 || true
-	systemctl restart fail2ban || __log_warn "Failed to restart fail2ban"
+	__enable_restart_service fail2ban warn
 	__log_success "fail2ban configured"
 }
 
@@ -2649,9 +2660,7 @@ __configure_nftables() {
 
 	nft -c -f /etc/nftables.conf || __log_fatal "Invalid nftables configuration"
 
-	__unmask_service_if_needed nftables
-	systemctl enable nftables >/dev/null 2>&1 || true
-	systemctl restart nftables || __log_fatal "Failed to restart nftables"
+	__enable_restart_service nftables
 
 	__log_success "Firewall configured"
 }
@@ -2877,9 +2886,7 @@ __configure_bind9() {
 	SYSTEMD
 
 	systemctl daemon-reload
-	__unmask_service_if_needed bind9
-	systemctl enable bind9 >/dev/null 2>&1 || true
-	systemctl restart bind9 || __log_fatal "Failed to start BIND9"
+	__enable_restart_service bind9 fatal "Failed to start BIND9"
 
 	for _ in 1 2 3 4 5; do
 		sleep 1
@@ -2915,9 +2922,7 @@ __configure_dhcp() {
 				INTERFACES="${DHCP_RELAY_INTERFACES}"
 				OPTIONS=""
 			EOF
-			__unmask_service_if_needed isc-dhcp-relay
-			systemctl enable isc-dhcp-relay >/dev/null 2>&1 || true
-			systemctl restart isc-dhcp-relay || __log_warn "Failed to restart DHCP relay"
+			__enable_restart_service isc-dhcp-relay warn "Failed to restart DHCP relay"
 		else
 			__log_warn "dhcrelay not available; DHCP relay not configured"
 		fi
@@ -3026,9 +3031,7 @@ __configure_dhcp() {
 
 	dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1 || __log_fatal "Invalid DHCPv4 configuration"
 
-	__unmask_service_if_needed isc-dhcp-server
-	systemctl enable isc-dhcp-server >/dev/null 2>&1 || true
-	systemctl restart isc-dhcp-server || __log_fatal "Failed to restart isc-dhcp-server"
+	__enable_restart_service isc-dhcp-server
 
 	__log_success "DHCP configured"
 }
@@ -3066,9 +3069,7 @@ __configure_radvd() {
 
 	radvd -C /etc/radvd.conf -n -c >/dev/null 2>&1 || __log_warn "radvd config validation failed"
 
-	__unmask_service_if_needed radvd
-	systemctl enable radvd >/dev/null 2>&1 || true
-	systemctl restart radvd || __log_fatal "Failed to restart radvd"
+	__enable_restart_service radvd
 
 	__log_success "IPv6 RA configured"
 }
@@ -3174,9 +3175,7 @@ __configure_postfix() {
 	fi
 	newaliases >/dev/null 2>&1
 
-	__unmask_service_if_needed postfix
-	systemctl enable postfix >/dev/null 2>&1 || true
-	systemctl restart postfix || __log_fatal "Failed to restart postfix"
+	__enable_restart_service postfix
 
 	__log_success "Postfix configured"
 	if [ "$POSTFIX_SERVER_TYPE" = "internet" ] || __is_enabled "$POSTFIX_WAN_ENABLE"; then
@@ -3426,9 +3425,7 @@ __configure_nginx() {
 	EOF
 
 	nginx -t >/dev/null 2>&1 || __log_fatal "Invalid nginx configuration"
-	__unmask_service_if_needed nginx
-	systemctl enable nginx >/dev/null 2>&1 || true
-	systemctl restart nginx || __log_fatal "Failed to restart nginx"
+	__enable_restart_service nginx
 
 	__log_success "nginx configured"
 	__add_summary "Configured nginx reverse proxy for ${fqdn}"
