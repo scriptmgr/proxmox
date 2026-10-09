@@ -65,8 +65,25 @@ Run the whole sequence with `tests/container-test.sh`. It pulls `PROXMOX_TEST_IM
 
 Each scenario runs `install.sh` twice (the second run checks idempotency), then runs the validation commands below plus hostname, `/etc/hosts`, `pve-cluster`, node directory, certificate, `nginx -t` and service checks. `--scenario NAME` runs one scenario, `PROXMOX_TEST_HOSTNAME` pins the base hostname to reproduce a failure, and `--keep` leaves containers and logs for inspection. Failed scenarios keep their container; logs go to a temp directory outside the project.
 
+Image notes (`rtedpro/proxmox` is built for Docker and ships build-time stubs that stay in place at runtime):
+
+- `/usr/local/sbin/systemctl` is a no-op (`exit 0`) that comes before the real `/usr/bin/systemctl` on `PATH`. Bare `systemctl` calls do nothing and `is-active` always succeeds. `tests/container-test.sh` removes it in each container before the install runs; for a manual container, run `docker exec proxmoxve rm -f /usr/local/sbin/systemctl` or use a login shell (which resets `PATH`).
+- `/usr/sbin/ifreload` exits 0 for everything except `-V`, so network reloads never apply live. Checks validate generated config, not live bridges.
+- `/usr/lib/modules`, `/boot` and `/usr/lib/firmware` are removed, so `modprobe` cannot load modules.
+- PID 1 is the real systemd (via `/usr/local/bin/entrypoint.sh`), and a healthy container reports `running` or `degraded` from `/usr/bin/systemctl is-system-running`.
+- Inspect the image without the Docker daemon with `skopeo inspect docker://docker.io/rtedpro/proxmox:latest` or `skopeo copy` to a directory under a temp path.
+
+Image tags and scope (from the `rtedpro-cpu/dockermox` project that builds the image):
+
+- Release tags are `rtedpro/proxmox:9.2.11` (slim, about 2 GB) and `rtedpro/proxmox:9.2.11-full` (about 4 GB, keeps kernel modules and firmware). `latest` is not a release; pin a tag with `PROXMOX_TEST_IMAGE` for reproducible runs, and use the `-full` tag to exercise paths that need `modprobe`.
+- Only the amd64 images are tested. The arm64 image is a different build (from PXVIRT, root password `root`).
+- The host must have `/dev/fuse` (load the `fuse` module if it is missing); `tests/container-test.sh` stops early without it.
+- No `vmbr0` bridge exists in the container by default, and `install.sh` defaults its WAN bridge to `vmbr0`. Network checks cover generated config, not live bridges.
+- Applying network configuration in the privileged container may reboot the host (a documented dockermox warning), so run the matrix only on a disposable machine.
+
 Rules:
 
+- The Docker daemon must be running.
 - Project verification executes `install.sh` inside that container, not on the host.
 - The container is privileged and shares the host kernel, so `install.sh` kernel-level changes (modules, `kvm` nested parameter) reach the host. Run it on a disposable test machine.
 - Avoid large downloads (ISOs, templates) during automated testing unless explicitly requested; `DOWNLOAD_ISOS` and `DOWNLOAD_TEMPLATES` stay `no`.

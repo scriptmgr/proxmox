@@ -2,8 +2,11 @@
 # shellcheck shell=bash
 # Runs install.sh inside fresh Proxmox test containers (a three-scenario matrix), validates each result, and removes the containers.
 # Usage: tests/container-test.sh [--scenario random|node-name|fqdn] [--keep] [--help]
-# Env:   PROXMOX_TEST_IMAGE (default rtedpro/proxmox:latest), PROXMOX_TEST_TIMEOUT seconds per install run (default 1800),
+# Env:   PROXMOX_TEST_IMAGE (default rtedpro/proxmox:latest; pin a release tag or use -full), PROXMOX_TEST_TIMEOUT seconds per install run (default 1800),
 #        PROXMOX_TEST_HOSTNAME pins the base short hostname so a failing run can be reproduced
+# Image notes: rtedpro/proxmox ships build-time stubs that stay in place at runtime. /usr/local/sbin/systemctl is a no-op (exit 0) that shadows the
+# real /usr/bin/systemctl, so each container removes it first. /usr/sbin/ifreload is a no-op except for -V, so network reloads never apply live,
+# and /usr/lib/modules is deleted, so modprobe cannot load modules. The checks validate generated config and service state, not live bridges.
 
 set -uo pipefail
 
@@ -42,7 +45,8 @@ __usage() {
 		  --help           Show this help
 
 		Environment:
-		  PROXMOX_TEST_IMAGE     Test image (default rtedpro/proxmox:latest)
+		  PROXMOX_TEST_IMAGE     Test image (default rtedpro/proxmox:latest); pin a release such as
+		                         rtedpro/proxmox:9.2.11, or use the -full tag (keeps kernel modules)
 		  PROXMOX_TEST_TIMEOUT   Seconds allowed per install run (default 1800)
 		  PROXMOX_TEST_HOSTNAME  Pin the base short hostname for reproducing a failure
 	EOF
@@ -91,7 +95,7 @@ __check() {
 __wait_for_systemd() {
 	local state
 	for _ in $(seq 1 60); do
-		state="$(docker exec "$CONTAINER" systemctl is-system-running 2>/dev/null || true)"
+		state="$(docker exec "$CONTAINER" /usr/bin/systemctl is-system-running 2>/dev/null || true)"
 		case "$state" in
 		running | degraded) return 0 ;;
 		esac
@@ -105,7 +109,12 @@ __run_install() {
 	local env_args=(-e AUTO_DIST_UPGRADE=no -e DOWNLOAD_ISOS=no -e DOWNLOAD_TEMPLATES=no -e RUN_PROXMENUX=no)
 	[ -z "$node_name" ] || env_args+=(-e "PVE_NODE_NAME=${node_name}")
 	timeout "$INSTALL_TIMEOUT" docker exec "${env_args[@]}" "$CONTAINER" bash /root/install.sh >"$log" 2>&1
-	__record "$label" "$?"
+	local rc=$?
+	__record "$label" "$rc"
+	if [ "$rc" -ne 0 ]; then
+		printf '      last lines of %s:\n' "$log"
+		tail -n 12 "$log" | sed 's/^/      | /'
+	fi
 }
 
 # Args: scenario name, container hostname, PVE_NODE_NAME (empty for none), expected node name
@@ -132,8 +141,11 @@ __run_scenario() {
 		return 1
 	fi
 
+	docker exec "$CONTAINER" rm -f /usr/local/sbin/systemctl
 	docker cp "$INSTALL_SCRIPT" "${CONTAINER}:/root/install.sh"
 
+	# shellcheck disable=SC2016
+	__check "${name}: systemctl is the real binary" 'case "$(systemctl is-system-running)" in running|degraded) true ;; *) false ;; esac'
 	__check "${name}: bash -n install.sh" "bash -n /root/install.sh"
 	__run_install "${name}: install.sh first run" "${SCENARIO_DIR}/install-1.log" "$node_name"
 	__run_install "${name}: install.sh second run (idempotent)" "${SCENARIO_DIR}/install-2.log" "$node_name"
@@ -204,6 +216,10 @@ __main() {
 	}
 	[ -f "$INSTALL_SCRIPT" ] || {
 		echo "install.sh not found at ${INSTALL_SCRIPT}" >&2
+		return 1
+	}
+	[ -e /dev/fuse ] || {
+		echo "/dev/fuse is missing on this host; load the fuse module (modprobe fuse) before running the Proxmox container" >&2
 		return 1
 	}
 

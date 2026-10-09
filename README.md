@@ -488,6 +488,15 @@ docker run -itd --name proxmoxve --hostname pve -p 8006:8006 --privileged rtedpr
 
 Project verification should execute `install.sh` inside the declared Proxmox test container, not on the host. `tests/container-test.sh` automates this with a three-scenario matrix (random hostname, random hostname plus `PVE_NODE_NAME`, and an FQDN hostname). Each scenario starts a fresh container, runs `install.sh` twice to check idempotency, runs the validation checks, and removes the container on success. Use `--scenario NAME` to run one, `--keep` to keep containers, and `PROXMOX_TEST_HOSTNAME` to pin a hostname when reproducing a failure. The containers are privileged and share the host kernel, so run it on a disposable test machine.
 
+Image notes for `rtedpro/proxmox`:
+
+- `/usr/local/sbin/systemctl` is a build-time no-op stub that shadows the real `systemctl`. `tests/container-test.sh` removes it in each container. In a manual container, run `docker exec proxmoxve rm -f /usr/local/sbin/systemctl` or use a login shell.
+- `/usr/sbin/ifreload` is a no-op, so network reloads do not apply live.
+- Kernel modules and firmware are removed, so `modprobe` cannot load modules.
+- The Docker daemon must be running to use the test container, and the host needs `/dev/fuse` (`modprobe fuse` if it is missing).
+- Release tags are `rtedpro/proxmox:9.2.11` (slim) and `rtedpro/proxmox:9.2.11-full` (keeps kernel modules and firmware). `latest` is not a release, so pin one with `PROXMOX_TEST_IMAGE` for reproducible runs. Only amd64 images are tested.
+- No `vmbr0` bridge exists in the container by default, and applying network configuration in the privileged container may reboot the host. Run the matrix only on a disposable machine.
+
 Typical validation commands inside the container:
 
 ```bash
