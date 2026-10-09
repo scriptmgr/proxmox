@@ -1669,7 +1669,7 @@ __reload_network_config() {
 			if [ "$rc" -eq 0 ]; then
 				return 0
 			fi
-			if printf '%s\n' "$output" | grep -q -- "Another instance of this program is already running"; then
+			if [[ "$output" == *"Another instance of this program is already running"* ]]; then
 				__log_warn "ifreload busy; retrying (${attempt}/3)"
 				sleep 2
 				continue
@@ -2103,7 +2103,7 @@ ${wan_ip_current}/24"
 __get_host_fqdn() {
 	local fqdn
 	fqdn="$(hostname -f 2>/dev/null || true)"
-	if [ -n "$fqdn" ] && printf '%s' "$fqdn" | grep -q -- '\.'; then
+	if [ -n "$fqdn" ] && [[ "$fqdn" == *.* ]]; then
 		echo "$fqdn"
 		return 0
 	fi
