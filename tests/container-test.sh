@@ -119,7 +119,7 @@ __run_install() {
 
 # Args: scenario name, container hostname, PVE_NODE_NAME (empty for none), expected node name
 __run_scenario() {
-	local name="$1" container_host="$2" node_name="$3" resolve_cmd hosts_cmd
+	local name="$1" container_host="$2" node_name="$3" resolve_cmd hosts_cmd lo_cmd
 	EXPECTED_NODE="$4"
 	CONTAINER="proxmox-test-${WORK_DIR##*-}-${name}"
 	SCENARIO_DIR="${WORK_DIR}/${name}"
@@ -142,6 +142,8 @@ __run_scenario() {
 	fi
 
 	docker exec "$CONTAINER" rm -f /usr/local/sbin/systemctl
+	# Remove the localhost entries Docker injects so the install must restore them; a wildcard search domain breaks Proxmox without them
+	docker exec "$CONTAINER" bash -c 'grep -v -- localhost /etc/hosts >/root/hosts.nolocalhost; cat /root/hosts.nolocalhost >/etc/hosts'
 	docker cp "$INSTALL_SCRIPT" "${CONTAINER}:/root/install.sh"
 
 	# shellcheck disable=SC2016
@@ -160,6 +162,9 @@ __run_scenario() {
 	# shellcheck disable=SC2016
 	hosts_cmd='awk -v n="@NODE@" '"'"'$1 !~ /^#/ && $1 !~ /^127\./ && $1 != "::1" { for (i = 2; i <= NF; i++) if ($i == n) f = 1 } END { exit !f }'"'"' /etc/hosts'
 	__check "${name}: /etc/hosts maps the node name to a non-loopback IP" "$hosts_cmd"
+	lo_cmd="grep -q -E -- '^127\\.0\\.0\\.1([[:space:]].*)?[[:space:]]localhost([[:space:]]|$)' /etc/hosts"
+	lo_cmd="${lo_cmd} && grep -q -E -- '^::1([[:space:]].*)?[[:space:]]localhost([[:space:]]|$)' /etc/hosts"
+	__check "${name}: /etc/hosts has IPv4 and IPv6 localhost entries" "$lo_cmd"
 	__check "${name}: pve-cluster is active" "systemctl is-active --quiet pve-cluster"
 	__check "${name}: /etc/pve/nodes/@NODE@ exists" "[ -d /etc/pve/nodes/@NODE@ ]"
 	__check "${name}: Proxmox certificate and key exist" "[ -f /etc/pve/local/pve-ssl.pem ] && [ -f /etc/pve/local/pve-ssl.key ]"

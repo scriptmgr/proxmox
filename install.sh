@@ -2183,6 +2183,29 @@ __get_target_node_name() {
 	echo "${PVE_NODE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
 }
 
+__hosts_has_loopback_name() {
+	awk -v addr="$1" '$1 == addr { for (i = 2; i <= NF; i++) if ($i == "localhost") found = 1 } END { exit !found }' /etc/hosts 2>/dev/null
+}
+
+__ensure_localhost_hosts_entries() {
+	local hosts_tmp
+	hosts_tmp="$(mktemp)"
+	if ! __hosts_has_loopback_name 127.0.0.1; then
+		printf '127.0.0.1 localhost.localdomain localhost\n' >>"$hosts_tmp"
+	fi
+	if ! __hosts_has_loopback_name ::1; then
+		printf '::1 localhost ip6-localhost ip6-loopback\n' >>"$hosts_tmp"
+	fi
+	if [ -s "$hosts_tmp" ]; then
+		__log_info "Adding missing localhost entries to /etc/hosts so Proxmox services do not bind to a DNS address..."
+		__backup_file /etc/hosts
+		[ ! -f /etc/hosts ] || cat /etc/hosts >>"$hosts_tmp"
+		cat "$hosts_tmp" >/etc/hosts
+		__add_summary "Added missing localhost entries to /etc/hosts"
+	fi
+	rm -f "$hosts_tmp"
+}
+
 __is_local_ip() {
 	ip -o addr show 2>/dev/null | awk -v addr="$1" '{ split($4, a, "/"); if (a[1] == addr) found = 1 } END { exit !found }'
 }
@@ -2285,6 +2308,7 @@ __ensure_pve_cert() {
 
 __proxmox_init() {
 	__log_info "Initializing Proxmox node..."
+	__ensure_localhost_hosts_entries
 	__ensure_node_hosts_entry
 	__ensure_pve_cluster
 	__ensure_pve_node_dir

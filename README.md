@@ -303,7 +303,7 @@ Legacy variables such as `MAIL_RELAY_HOST`, `MAIL_RELAY_PORT`, and `ROOT_MAIL_FO
 - `/etc/nginx/*` is rebuilt during bootstrap while preserving `mime.types`
 - The generated vhost lives at `/etc/nginx/vhosts.d/{fqdn}.conf`
 - HTTP redirects to HTTPS and HTTPS proxies to the `pveproxy` upstream, which points at `{fqdn}:8006`, so the host FQDN must resolve to the Proxmox host
-- Right after the network step, the bootstrap makes sure the node name maps in `/etc/hosts` to the primary route address (the LAN bridge address is only a fallback when no route exists; a stale entry is replaced), starts `pve-cluster`, aligns `/etc/pve/nodes/{node}` with the node name, and regenerates a missing `pve-ssl.pem` or `pve-ssl.key` with `pvecm updatecerts --force`
+- Right after the network step, the bootstrap makes sure `/etc/hosts` has `localhost` entries for IPv4 and IPv6 (a missing entry breaks the console proxy when a wildcard DNS search domain answers for `localhost`), makes sure the node name maps in `/etc/hosts` to the primary route address (the LAN bridge address is only a fallback when no route exists; a stale entry is replaced), starts `pve-cluster`, aligns `/etc/pve/nodes/{node}` with the node name, and regenerates a missing `pve-ssl.pem` or `pve-ssl.key` with `pvecm updatecerts --force`
 - nginx serves a Let's Encrypt certificate from `/etc/letsencrypt/live/domain` or `/etc/letsencrypt/live/{fqdn}` when one exists, otherwise the Proxmox node certificate in `/etc/pve/local/`
 - When a Let's Encrypt directory exists, the bootstrap also installs a Certbot deploy hook that copies `fullchain.pem` and `privkey.pem` into the Proxmox certificate files without symlinks and reloads `pveproxy` and `nginx`
 
