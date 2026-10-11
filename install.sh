@@ -2342,28 +2342,24 @@ __ensure_pve_node_dir() {
 }
 
 __ensure_pve_cert() {
-	local pve_cert pve_key pve_ca regenerate
+	local pve_cert pve_key pve_ca
 	pve_cert="/etc/pve/local/pve-ssl.pem"
 	pve_key="/etc/pve/local/pve-ssl.key"
 	pve_ca="/etc/pve/pve-root-ca.pem"
-	regenerate=false
 
 	if [ -f "$pve_cert" ] && [ -f "$pve_key" ] && [ -f "$pve_ca" ] && openssl verify -CAfile "$pve_ca" "$pve_cert" >/dev/null 2>&1; then
 		return 0
 	fi
 
 	__command_exists pvecm || __log_fatal "Missing or invalid Proxmox node certificate and pvecm is not available to create it"
-	if [ -f "$pve_cert" ] && [ -f "$pve_key" ]; then
-		regenerate=true
-	fi
 	__log_info "Proxmox node certificate missing or not signed by the cluster CA; generating with pvecm updatecerts..."
 	pvecm updatecerts --force || __log_fatal "Failed to generate Proxmox SSL certificate"
-	if $regenerate; then
-		systemctl restart pveproxy >/dev/null 2>&1 || true
-	fi
-
 	[ -f "$pve_cert" ] || __log_fatal "Missing Proxmox SSL certificate after pvecm updatecerts: $pve_cert"
 	[ -f "$pve_key" ] || __log_fatal "Missing Proxmox SSL key after pvecm updatecerts: $pve_key"
+	if ! openssl verify -CAfile "$pve_ca" "$pve_cert" >/dev/null 2>&1; then
+		__log_fatal "Proxmox node certificate is still not signed by the cluster CA after pvecm updatecerts: $pve_cert"
+	fi
+	systemctl restart pveproxy spiceproxy || __log_fatal "Failed to restart pveproxy and spiceproxy after regenerating the Proxmox node certificate"
 	__add_summary "Generated Proxmox node certificate with pvecm updatecerts"
 }
 

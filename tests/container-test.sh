@@ -168,6 +168,7 @@ __run_scenario() {
 	__check "${name}: pve-cluster is active" "systemctl is-active --quiet pve-cluster"
 	__check "${name}: /etc/pve/nodes/@NODE@ exists" "[ -d /etc/pve/nodes/@NODE@ ]"
 	__check "${name}: Proxmox certificate and key exist" "[ -f /etc/pve/local/pve-ssl.pem ] && [ -f /etc/pve/local/pve-ssl.key ]"
+	__check "${name}: Proxmox node certificate verifies against the cluster CA" "openssl verify -CAfile /etc/pve/pve-root-ca.pem /etc/pve/local/pve-ssl.pem"
 	__check "${name}: nft -c -f /etc/nftables.conf" "nft -c -f /etc/nftables.conf"
 	__check "${name}: named-checkconf" "named-checkconf /etc/bind/named.conf"
 	__check "${name}: dhcpd -t" "dhcpd -t -cf /etc/dhcp/dhcpd.conf"
