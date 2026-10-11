@@ -2381,6 +2381,27 @@ __ensure_pve_cert() {
 	__add_summary "Generated Proxmox node certificate with pvecm updatecerts"
 }
 
+__warn_stale_spice_certs() {
+	local pve_cert expected_fingerprint vmid monitor_output tls_port served_fingerprint
+	pve_cert="/etc/pve/local/pve-ssl.pem"
+	[ -f "$pve_cert" ] || return 0
+	__command_exists qm || return 0
+	expected_fingerprint="$(openssl x509 -in "$pve_cert" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')"
+	[ -n "$expected_fingerprint" ] || return 0
+
+	while read -r vmid; do
+		[ -n "$vmid" ] || continue
+		monitor_output="$(printf 'info spice\nquit\n' | qm monitor "$vmid" 2>/dev/null)" || continue
+		tls_port="$(printf '%s\n' "$monitor_output" | sed -n 's/.*address: 127\.0\.0\.1:\([0-9][0-9]*\) \[tls\].*/\1/p' | head -n 1)"
+		[ -n "$tls_port" ] || continue
+		served_fingerprint="$(openssl s_client -connect "127.0.0.1:${tls_port}" -showcerts </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//' || true)"
+		[ -n "$served_fingerprint" ] || continue
+		if [ "$served_fingerprint" != "$expected_fingerprint" ]; then
+			__log_warn "VM ${vmid} is serving a stale SPICE certificate; shut down and start the VM to load the current Proxmox node certificate"
+		fi
+	done < <(qm list 2>/dev/null | awk 'NR > 1 && $3 == "running" { print $1 }')
+}
+
 __proxmox_init() {
 	__log_info "Initializing Proxmox node..."
 	__ensure_localhost_hosts_entries
@@ -2388,6 +2409,7 @@ __proxmox_init() {
 	__ensure_pve_cluster
 	__ensure_pve_node_dir
 	__ensure_pve_cert
+	__warn_stale_spice_certs
 	__log_success "Proxmox node initialized"
 }
 
