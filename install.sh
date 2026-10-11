@@ -2288,22 +2288,29 @@ __ensure_pve_node_dir() {
 }
 
 __ensure_pve_cert() {
-	local pve_cert pve_key
+	local pve_cert pve_key pve_ca regenerate
 	pve_cert="/etc/pve/local/pve-ssl.pem"
 	pve_key="/etc/pve/local/pve-ssl.key"
+	pve_ca="/etc/pve/pve-root-ca.pem"
+	regenerate=false
 
-	if [ -f "$pve_cert" ] && [ -f "$pve_key" ]; then
+	if [ -f "$pve_cert" ] && [ -f "$pve_key" ] && [ -f "$pve_ca" ] && openssl verify -CAfile "$pve_ca" "$pve_cert" >/dev/null 2>&1; then
 		return 0
 	fi
 
-	__command_exists pvecm || __log_fatal "Missing Proxmox SSL certificate and pvecm is not available to create it"
-	__log_info "Proxmox SSL certificate missing; generating with pvecm updatecerts..."
+	__command_exists pvecm || __log_fatal "Missing or invalid Proxmox node certificate and pvecm is not available to create it"
+	if [ -f "$pve_cert" ] && [ -f "$pve_key" ]; then
+		regenerate=true
+	fi
+	__log_info "Proxmox node certificate missing or not signed by the cluster CA; generating with pvecm updatecerts..."
 	pvecm updatecerts --force || __log_fatal "Failed to generate Proxmox SSL certificate"
-	systemctl restart pveproxy >/dev/null 2>&1 || true
+	if $regenerate; then
+		systemctl restart pveproxy >/dev/null 2>&1 || true
+	fi
 
 	[ -f "$pve_cert" ] || __log_fatal "Missing Proxmox SSL certificate after pvecm updatecerts: $pve_cert"
 	[ -f "$pve_key" ] || __log_fatal "Missing Proxmox SSL key after pvecm updatecerts: $pve_key"
-	__add_summary "Generated Proxmox SSL certificate with pvecm updatecerts"
+	__add_summary "Generated Proxmox node certificate with pvecm updatecerts"
 }
 
 __proxmox_init() {
@@ -3213,8 +3220,8 @@ set -euo pipefail
 
 	cp "${lineage}/fullchain.pem" "$cert_tmp"
 	cp "${lineage}/privkey.pem" "$key_tmp"
-	cp "$cert_tmp" /etc/pve/local/pve-ssl.pem
-	cp "$key_tmp" /etc/pve/local/pve-ssl.key
+	cp "$cert_tmp" /etc/pve/local/pveproxy-ssl.pem
+	cp "$key_tmp" /etc/pve/local/pveproxy-ssl.key
 
 	systemctl reload-or-restart pveproxy >/dev/null 2>&1 || systemctl restart pveproxy >/dev/null 2>&1 || true
 	if systemctl is-active --quiet nginx; then
@@ -3807,7 +3814,7 @@ __main() {
 	if __is_enabled "$CONFIGURE_POSTFIX"; then
 		__run_task postfix __configure_postfix
 	fi
-	__run_task tls_certs __configure_letsencrypt_pve_cert_hook
+	__configure_letsencrypt_pve_cert_hook
 	__run_task nginx __configure_nginx
 	if __is_enabled "$CONFIGURE_SDN"; then
 		__run_task sdn __configure_sdn
