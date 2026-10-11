@@ -35,8 +35,10 @@ PROXMOX_LOG_DIR="/var/log/proxmox-bootstrap"
 PROXMOX_LOG_FILE="${PROXMOX_LOG_DIR}/bootstrap.log"
 PROXMOX_BACKUP_BASE_DIR="/mnt/Backups/proxmox"
 PROXMOX_BACKUP_DIR="${PROXMOX_BACKUP_BASE_DIR}/$(date +%Y%m%d_%H%M%S)"
-PROXMOX_STATE_FILE="/var/lib/proxmox-bootstrap-state"
+PROXMOX_STATE_FILE="/var/lib/proxmox/bootstrap-state"
 PROXMOX_RESOLVED_NETWORK_STATE_FILE="${PROXMOX_STATE_FILE}.network"
+PROXMOX_LEGACY_STATE_FILE="/var/lib/proxmox-bootstrap-state"
+PROXMOX_LEGACY_RESOLVED_NETWORK_STATE_FILE="${PROXMOX_LEGACY_STATE_FILE}.network"
 PROXMOX_OPTIONAL_TOOLS_DIR="/usr/local/share/proxmox-bootstrap/tools"
 PROXMOX_PROXMENUX_INSTALLER_URL="https://raw.githubusercontent.com/MacRimi/ProxMenux/main/install_proxmenux.sh"
 PROXMOX_ORIGINAL_ENV_KEYS="$(env | awk -F= '{print $1}')"
@@ -660,6 +662,27 @@ __mark_task_done() {
 	__with_state_lock __write_task_state "$task"
 }
 
+__migrate_state_files() {
+	mkdir -p "${PROXMOX_STATE_FILE%/*}"
+
+	if [ -f "$PROXMOX_LEGACY_STATE_FILE" ]; then
+		if [ -f "$PROXMOX_STATE_FILE" ]; then
+			cat "$PROXMOX_LEGACY_STATE_FILE" >>"$PROXMOX_STATE_FILE"
+			rm -f "$PROXMOX_LEGACY_STATE_FILE"
+		else
+			mv "$PROXMOX_LEGACY_STATE_FILE" "$PROXMOX_STATE_FILE"
+		fi
+	fi
+
+	if [ -f "$PROXMOX_LEGACY_RESOLVED_NETWORK_STATE_FILE" ]; then
+		if [ -f "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" ]; then
+			rm -f "$PROXMOX_LEGACY_RESOLVED_NETWORK_STATE_FILE"
+		else
+			mv "$PROXMOX_LEGACY_RESOLVED_NETWORK_STATE_FILE" "$PROXMOX_RESOLVED_NETWORK_STATE_FILE"
+		fi
+	fi
+}
+
 __run_task() {
 	local task="$1"
 	local fn="$2"
@@ -674,6 +697,7 @@ __run_task() {
 }
 
 __show_status() {
+	__migrate_state_files
 	if [ ! -f "$PROXMOX_STATE_FILE" ]; then
 		echo "No completed tasks recorded."
 		return 0
@@ -688,9 +712,11 @@ __show_status() {
 
 __clear_state() {
 	local task="${1:-}"
+	__migrate_state_files
 
 	if [ -z "$task" ]; then
 		rm -f "$PROXMOX_STATE_FILE"
+		rm -f "$PROXMOX_LEGACY_STATE_FILE"
 		rm -f "${PROXMOX_STATE_FILE}.lock"
 		rmdir "${PROXMOX_STATE_FILE}.lock.d" 2>/dev/null || true
 		echo "Cleared all state."
@@ -765,8 +791,8 @@ __reset_bootstrap() {
 	DEBIAN_FRONTEND=noninteractive apt-get purge -y "${packages[@]}" >/dev/null 2>&1 || __log_warn "Some bootstrap-managed packages could not be purged"
 	DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
 
-	rm -f "$PROXMOX_STATE_FILE"
-	rm -f "$PROXMOX_RESOLVED_NETWORK_STATE_FILE"
+	rm -f "$PROXMOX_STATE_FILE" "$PROXMOX_LEGACY_STATE_FILE"
+	rm -f "$PROXMOX_RESOLVED_NETWORK_STATE_FILE" "$PROXMOX_LEGACY_RESOLVED_NETWORK_STATE_FILE"
 	__log_success "Reset complete; backups preserved at $PROXMOX_BACKUP_DIR"
 }
 
@@ -1830,6 +1856,14 @@ __router_bridge_vlan_aware_configured() {
 
 __resolve_router_lab_network() {
 	local lan_dummy_idx lan_bridge_idx preferred_router_idx preferred_bridge_idx ports
+	if __has_bridged_dummy_port &&
+		! __resolved_network_override_supplied "ROUTER_BR" "" &&
+		! __resolved_network_override_supplied "ROUTER_NIC" ""; then
+		ROUTER_BR=""
+		ROUTER_NIC=""
+		__log_info "Existing dummy-backed bridge detected, skipping router-lab bridge creation"
+		return 0
+	fi
 
 	case "$LAN_NIC" in
 	pvedummy[0-9]*)
@@ -1881,6 +1915,26 @@ __resolve_router_lab_network() {
 			fi
 		fi
 	fi
+}
+
+__has_bridged_dummy_port() {
+	local interfaces_file="${1:-/etc/network/interfaces}"
+	awk '
+		$1 == "iface" {
+			in_stanza = ($3 == "inet")
+			next
+		}
+		$1 == "auto" || $1 == "source" { in_stanza = 0 }
+		in_stanza && $1 == "bridge-ports" {
+			for (i = 2; i <= NF; i++) {
+				if ($i ~ /^pvedummy[0-9]+$/) {
+					found = 1
+					exit 0
+				}
+			}
+		}
+		END { exit(found ? 0 : 1) }
+	' "$interfaces_file" 2>/dev/null
 }
 
 __ensure_lan_bridge_settings() {
@@ -3781,6 +3835,7 @@ __main() {
 		set -x
 	fi
 	__check_root
+	__migrate_state_files
 
 	mkdir -p "$PROXMOX_LOG_DIR" "$PROXMOX_BACKUP_DIR"
 	__warn_if_backup_parent_unmounted

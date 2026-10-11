@@ -75,7 +75,7 @@ The script is intended to work on first run with no required user config.
   2. `$(hostname -s).home`
   3. `pve.home`
 - On single-NIC hosts, the script keeps WAN intact and creates a dummy-backed LAN bridge using `pvedummy{num}`
-- When LAN is dummy-backed, the script also adds a separate router-lab pair using the next indices: `pverouter{num+1}` on `vmbr{num+1}`
+- When no bridge already uses a `pvedummy{num}` port, the script adds a separate router-lab pair using the next indices: `pverouter{num+1}` on `vmbr{num+1}`. An existing bridge with a dummy port suppresses that automatic pair; setting `ROUTER_BR` or `ROUTER_NIC` explicitly keeps it enabled.
 - If the preferred LAN bridge already exists and is unsuitable, the script uses the next free `vmbr{num}`
 
 ### Optional Features
@@ -160,13 +160,13 @@ Target bridge model:
 - `vmbr1`: preferred LAN bridge
 - Guests should use the LAN bridge, not the WAN bridge
 - When LAN is dummy-backed, the original LAN pair stays on `pvedummy{num}` + `vmbr{num+1}`
-- A separate router-lab pair is added on the next indices so pfSense and other router/firewall guests can own a dedicated VLAN-aware segment
+- A separate router-lab pair is added on the next indices so pfSense and other router/firewall guests can own a dedicated VLAN-aware segment, unless an existing bridge already uses a `pvedummy{num}` port
 
 Behavior by host type:
 
-- **1 physical NIC**: preserve existing WAN behavior and add a dummy-backed LAN bridge plus a separate router-lab pair
-- **2 physical NICs**: preserve WAN, use the other NIC for LAN, and also add a dummy-backed router-lab pair
-- **More than 2 physical NICs**: preserve WAN and default LAN to dummy-backed mode unless `LAN_NIC` is explicitly set; also add a router-lab pair
+- **1 physical NIC**: preserve existing WAN behavior and add a dummy-backed LAN bridge; add a router-lab pair only when no existing bridge uses a dummy port
+- **2 physical NICs**: preserve WAN, use the other NIC for LAN, and add a router-lab pair only when no existing bridge uses a dummy port
+- **More than 2 physical NICs**: preserve WAN and default LAN to dummy-backed mode unless `LAN_NIC` is explicitly set; add a router-lab pair only when no existing bridge uses a dummy port
 
 Additional rules:
 
@@ -357,7 +357,7 @@ It does **not** automatically apply interactive or site-specific choices such as
 ## VM and LXC Defaults
 
 - Guests should default to the resolved LAN bridge
-- A separate router-lab bridge is created for pfSense or other router/firewall LAN testing when LAN is dummy-backed
+- A separate router-lab bridge is created for pfSense or other router/firewall LAN testing when no existing bridge uses a dummy port
 - Existing VM and LXC configs may be updated where safe
 - Complex or clearly intentional custom guest networking should not be broken
 - `GUEST_DEFAULT_BRIDGE` defaults to the resolved LAN bridge
@@ -429,11 +429,14 @@ Notes:
 
 ## State and Idempotency
 
-State is tracked in:
+State is tracked under:
 
 ```text
-/var/lib/proxmox-bootstrap-state
+/var/lib/proxmox/bootstrap-state
+/var/lib/proxmox/bootstrap-state.network
 ```
+
+On first run after upgrading, the bootstrap migrates existing state files from `/var/lib/proxmox-bootstrap-state` and `/var/lib/proxmox-bootstrap-state.network`.
 
 The goal is safe re-runs:
 
@@ -463,8 +466,8 @@ Key paths:
 /etc/nginx/vhosts.d/
 /var/log/proxmox-bootstrap/bootstrap.log
 /mnt/Backups/proxmox/
-/var/lib/proxmox-bootstrap-state
-/var/lib/proxmox-bootstrap-state.network
+/var/lib/proxmox/bootstrap-state
+/var/lib/proxmox/bootstrap-state.network
 ```
 
 Notes:
