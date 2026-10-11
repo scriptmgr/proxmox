@@ -2333,8 +2333,26 @@ __ensure_pve_node_dir() {
 	current="$(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n1)"
 
 	if [ "$count" -eq 1 ] && { [ ! -f /etc/pve/corosync.conf ] || __is_enabled "$FORCE_NODE_RENAME"; }; then
-		mv "/etc/pve/nodes/${current}" "/etc/pve/nodes/${target}" || __log_fatal "Could not move /etc/pve/nodes/${current} to ${target}"
-		__log_success "Moved Proxmox node directory ${current} to ${target}"
+		mkdir "/etc/pve/nodes/${target}" || __log_fatal "Could not create /etc/pve/nodes/${target}"
+		if ! cp -R "/etc/pve/nodes/${current}/." "/etc/pve/nodes/${target}/"; then
+			find "/etc/pve/nodes/${target}" -mindepth 1 -depth -delete 2>/dev/null || true
+			rmdir "/etc/pve/nodes/${target}" 2>/dev/null || true
+			__log_fatal "Could not copy /etc/pve/nodes/${current} to ${target}"
+		fi
+		if ! diff -qr "/etc/pve/nodes/${current}" "/etc/pve/nodes/${target}" >/dev/null 2>&1; then
+			find "/etc/pve/nodes/${target}" -mindepth 1 -depth -delete 2>/dev/null || true
+			rmdir "/etc/pve/nodes/${target}" 2>/dev/null || true
+			__log_fatal "Copied Proxmox node directory ${current} to ${target}, but verification failed"
+		fi
+		find "/etc/pve/nodes/${current}" -mindepth 1 -depth -delete || __log_fatal "Copied ${current} to ${target}, but could not clear the old node directory"
+		rmdir "/etc/pve/nodes/${current}" || __log_fatal "Copied ${current} to ${target}, but could not remove the old node directory"
+		systemctl restart pve-cluster || __log_fatal "Could not restart pve-cluster after renaming the node directory"
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			[ "$(readlink /etc/pve/local 2>/dev/null || true)" = "nodes/${target}" ] && break
+			sleep 1
+		done
+		[ "$(readlink /etc/pve/local 2>/dev/null || true)" = "nodes/${target}" ] || __log_fatal "pve-cluster restarted but /etc/pve/local does not point to nodes/${target}"
+		__log_success "Copied and verified Proxmox node directory ${current} to ${target}"
 		__add_summary "Renamed Proxmox node directory ${current} to ${target}"
 	else
 		__log_fatal "Proxmox node directory /etc/pve/nodes/${target} is missing and cannot be moved safely (found ${count} node directories; clustered hosts need FORCE_NODE_RENAME=yes)"

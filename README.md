@@ -114,7 +114,7 @@ PIN_NEWEST_PVE_KERNEL="yes"    # pin the newest installed Proxmox kernel
 PVE_KERNEL_KEEP_COUNT="2"      # keep two installed Proxmox kernel versions total
 ENABLE_NESTED_VIRT="yes"       # enable KVM nested virtualization (default: yes)
 CONFIGURE_POSTFIX="yes"        # set to no to skip all Postfix configuration (default: yes)
-PVE_NODE_NAME=""               # rename the Proxmox node; updates hostname, /etc/hosts, /etc/pve/nodes/, and Postfix
+PVE_NODE_NAME=""               # rename the Proxmox node; copies /etc/pve/nodes/ state, then updates hostname, /etc/hosts, and Postfix
 FORCE_NODE_RENAME="no"         # set to yes to allow node rename when the host is part of a cluster
 ```
 
