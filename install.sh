@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202606261458-git
+##@Version           :  202610261133-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  WTFPL
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202606261458-git"
+VERSION="202610261133-git"
 
 set -eo pipefail
 
@@ -2565,6 +2565,8 @@ __configure_fail2ban() {
 		maxretry = 5
 		bantime = 1h
 		findtime = 10m
+		ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7
+		action = %(action_)s
 	EOF
 	__enable_restart_service fail2ban warn
 	__log_success "fail2ban configured"
@@ -2618,9 +2620,6 @@ __configure_nftables() {
 
 	__backup_file /etc/nftables.conf
 	local nat66_rules=""
-	local wan_mail_input="iifname \"${WAN_BR}\" tcp dport {25, 465, 587} drop"
-	local wan_dns_input=""
-	local forward_accept_rules=""
 	local prerouting_rules=""
 	local dns_ports dns_port postfix_forward_ip dns_forward_ip
 
@@ -2637,19 +2636,12 @@ __configure_nftables() {
 		)
 	fi
 
-	if [ "$POSTFIX_SERVER_TYPE" = "internet" ] || __is_enabled "$POSTFIX_WAN_ENABLE"; then
-		wan_mail_input="iifname \"${WAN_BR}\" tcp dport {25, 465, 587} accept"
-	fi
-
 	if [ "$POSTFIX_SERVER_TYPE" = "forward" ] && __reachable_host "$POSTFIX_FORWARD_HOST"; then
 		local mail_ports
 		postfix_forward_ip="$(__resolve_ipv4_host "$POSTFIX_FORWARD_HOST" || true)"
 		[ -n "$postfix_forward_ip" ] || __log_fatal "POSTFIX_FORWARD_HOST must resolve to an IPv4 address for nftables forwarding"
 		mail_ports="$(echo "$POSTFIX_FORWARD_PORTS" | tr ',' ' ')"
-		wan_mail_input="iifname \"${WAN_BR}\" tcp dport {${POSTFIX_FORWARD_PORTS//,/, }} accept"
 		for port in $mail_ports; do
-			forward_accept_rules="${forward_accept_rules}
-    tcp dport ${port} ip daddr ${postfix_forward_ip} accept"
 			prerouting_rules="${prerouting_rules}
     iifname { \"$WAN_BR\", \"$LAN_BR\" } tcp dport ${port} dnat to ${postfix_forward_ip}:${port}"
 		done
@@ -2662,23 +2654,12 @@ __configure_nftables() {
 		dns_ports="$(__split_csv_ports "${DNS_FORWARD_PORTS:-53}")"
 		if __is_enabled "$DNS_WAN_ENABLE"; then
 			dns_iif="iifname { \"${WAN_BR}\", \"${LAN_BR}\" }"
-			for dns_port in $dns_ports; do
-				wan_dns_input="${wan_dns_input}
-    iifname \"${WAN_BR}\" udp dport ${dns_port} accept
-    iifname \"${WAN_BR}\" tcp dport ${dns_port} accept"
-			done
 		fi
 		for dns_port in $dns_ports; do
-			forward_accept_rules="${forward_accept_rules}
-    ip daddr ${dns_forward_ip} udp dport ${dns_port} accept
-    ip daddr ${dns_forward_ip} tcp dport ${dns_port} accept"
 			prerouting_rules="${prerouting_rules}
     ${dns_iif} udp dport ${dns_port} dnat to ${dns_forward_ip}:${dns_port}
     ${dns_iif} tcp dport ${dns_port} dnat to ${dns_forward_ip}:${dns_port}"
 		done
-	elif __is_enabled "$DNS_WAN_ENABLE"; then
-		wan_dns_input="iifname \"${WAN_BR}\" udp dport 53 accept
-    iifname \"${WAN_BR}\" tcp dport 53 accept"
 	fi
 
 	cat > /etc/nftables.conf <<-EOF
@@ -2688,37 +2669,11 @@ __configure_nftables() {
 
 	table inet filter {
 	  chain input {
-	    type filter hook input priority filter; policy drop;
-
-	    ct state invalid drop
-	    ct state established,related accept
-
-	    iifname "lo" accept
-	    iifname "$LAN_BR" accept
-
-	    ip protocol icmp accept
-	    ip6 nexthdr icmpv6 accept
-
-	    iifname "$WAN_BR" tcp dport 22 accept
-	    iifname "$WAN_BR" tcp dport 80 accept
-	    iifname "$WAN_BR" tcp dport 443 accept
-	    iifname "$WAN_BR" tcp dport 8006 accept
-	    iifname "$WAN_BR" tcp dport 3128 accept
-	    iifname "$WAN_BR" udp dport 60000-61000 accept
-	    ${wan_dns_input}
-
-	    ${wan_mail_input}
+	    type filter hook input priority filter; policy accept;
 	  }
 
 	  chain forward {
-	    type filter hook forward priority filter; policy drop;
-
-	    ct state invalid drop
-	    ct state established,related accept
-
-	    iifname "$LAN_BR" oifname "$WAN_BR" accept
-	    iifname "$WAN_BR" oifname "$LAN_BR" ct state established,related accept
-	    ${forward_accept_rules}
+	    type filter hook forward priority filter; policy accept;
 	  }
 
 	  chain output {
@@ -3896,9 +3851,9 @@ __main() {
 	__run_task sysctl __configure_sysctl
 	__run_task vlan __configure_vlan_readiness
 	__run_task ssh __configure_ssh
-	__run_task fail2ban __configure_fail2ban
 	__run_task subscription_nag __configure_subscription_nag
 	__run_task firewall __configure_nftables
+	__configure_fail2ban
 	__run_task bind __configure_bind9
 	__run_task dhcp __configure_dhcp
 	__run_task radvd __configure_radvd

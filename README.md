@@ -309,20 +309,12 @@ Legacy variables such as `MAIL_RELAY_HOST`, `MAIL_RELAY_PORT`, and `ROOT_MAIL_FO
 
 ### Firewall
 
-The script configures nftables with:
+The nftables base input, forward, and output policies accept all traffic. Fail2ban can still add temporary SSH bans. The script also configures NAT:
 
 - IPv4 forwarding
 - IPv6 forwarding
 - IPv4 masquerading for LAN traffic to WAN
 - Optional NAT66 for ULA IPv6 (`NAT66_ENABLE=yes` by default; set to `no` to disable)
-- WAN and LAN access for:
-  - SSH `22`
-  - HTTP `80`
-  - HTTPS `443`
-  - Proxmox UI `8006`
-- LAN-only DNS and DHCP by default
-- WAN DNS only when `DNS_WAN_ENABLE=yes`
-- WAN mail only when explicitly enabled or required by the selected Postfix mode
 
 ## Repositories and Hardening
 
@@ -337,7 +329,7 @@ Default behavior:
 - Apply a non-interactive package upgrade by default
 - Pin the newest installed Proxmox kernel by default
 - Keep two installed Proxmox kernel versions total by default
-- Configure fail2ban for SSH protection
+- Configure fail2ban for SSH protection with non-email ban actions, excluding loopback and private IPv4/IPv6 ranges from bans
 - Keep AppArmor enabled in production
 - Remove the Proxmox subscription nag and install an upgrade-persistent reapply hook
 
